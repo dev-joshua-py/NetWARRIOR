@@ -1,16 +1,29 @@
 src = open('netwarrior.py', encoding='utf-8').read()
 
-# Fix the broken check_deps indentation
-bad = '''    _deps = ["rich", "scapy", "psutil", "paramiko", "dns", "aiohttp", "tomli", "tomli_w"]
+# Fix bare uvloop import
+bad = 'import uvloop'
+good = '''import sys as _sys
 if _sys.platform != "win32":
-    _deps.append("uvloop")
-for pkg in _deps:'''
+    import uvloop
+    _UVLOOP = True
+else:
+    _UVLOOP = False'''
 
-good = '''    _deps = ["rich", "scapy", "psutil", "paramiko", "dns", "aiohttp", "tomli", "tomli_w"]
-    if _sys.platform != "win32":
-        _deps.append("uvloop")
-    for pkg in _deps:'''
+if bad in src:
+    src = src.replace(bad, good)
+    print("uvloop import patched.")
+else:
+    print("uvloop line not found — already patched or different format.")
 
-src = src.replace(bad, good)
+# Fix uvloop.install() at bottom
+bad2 = '    uvloop.install()\n    try:\n        asyncio.run(main())'
+good2 = '    if _UVLOOP:\n        uvloop.install()\n    try:\n        asyncio.run(main())'
+
+if bad2 in src:
+    src = src.replace(bad2, good2)
+    print("uvloop.install() patched.")
+else:
+    print("uvloop.install() line not found — already patched.")
+
 open('netwarrior.py', 'w', encoding='utf-8').write(src)
-print('Fixed. Run: python netwarrior.py')
+print("Done. Run: python netwarrior.py")
