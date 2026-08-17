@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-NetWARRIOR Ultimate – Final Shippable Version
-All 50+ attack vectors, full async core, complete UI, all bugs fixed.
-"""
-
 import os
 import sys
 import time
