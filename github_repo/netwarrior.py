@@ -27,7 +27,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tomli_w
 import tomli
-import uvloop
+import sys as _sys
+_UVLOOP = False
+if _sys.platform != "win32":
+    try:
+        import uvloop
+        _UVLOOP = True
+    except ImportError:
+        pass
 import psutil
 import paramiko
 import dns.resolver
@@ -65,7 +72,7 @@ console = Console()
 # ──────────────────────────────────────────────────────────────────────────────
 def check_deps():
     missing = []
-    for pkg in ["rich", "scapy", "psutil", "paramiko", "dns", "aiohttp", "tomli", "tomli_w", "uvloop"]:
+    for pkg in ["rich", "scapy", "psutil", "paramiko", "dns", "aiohttp", "tomli", "tomli_w"]:
         try:
             __import__(pkg)
         except ImportError:
@@ -2868,7 +2875,8 @@ async def main():
         console.print("[green]Goodbye.[/]")
 
 if __name__ == "__main__":
-    uvloop.install()
+    if _UVLOOP:
+        uvloop.install()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
