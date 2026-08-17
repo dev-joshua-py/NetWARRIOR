@@ -123,6 +123,7 @@ sudo python3 netwarrior.py
 
 # Windows — run as Administrator, Npcap must be installed
 # https://npcap.com
+python patch.py
 python netwarrior.py
 ```
 
