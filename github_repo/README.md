@@ -115,6 +115,7 @@ tomli_w>=1.0.0
 ```bash
 git clone https://github.com/dev-joshua-py/NetWARRIOR.git
 cd netwarrior
+cd github_repo
 pip install -r requirements.txt
 
 # Linux — root required for raw packet injection
