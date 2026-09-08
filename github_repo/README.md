@@ -20,29 +20,39 @@ defend against them.
 
 ## Features
 
-### Attack Vectors (40+)   
-| Category       |                                             Vectors                                                          |
-|----------------|--------------------------------------------------------------------------------------------------------------|
-| Flood          | SYN, UDP, ICMP, ACK, RST, XMAS, NULL, FIN, Zero-Window, MAC, Smurf, LAND, SCTP INIT, Teardrop, Ping of Death |
-| Amplification  | DNS, NTP, SNMP, Memcached, SSDP, Chargen                                                                     |
-| Application    | Slowloris, HTTP flood, RUDY, Slow Read, HTTP/2 rapid reset, WebSocket flood                                  |
-| Layer 2 / Net  | ARP poison, VLAN double-tag, CDP/LLDP/STP flood                                                              |
-| IPv6           | RA flood, NA flood, NS flood                                                                                 |
-| WiFi           | Deauth, Beacon flood                                                                                         |
-| Misc           | GRE spoof, PCAP replay, LLMNR/NBNS/mDNS poison, DHCP starvation                                              |
+### Attack Vectors
+
+The full list, and the arguments each one takes, is in the in-app **ATTACK menu**
+(`1`), which is generated from the same catalog the `attack` command dispatches
+from — the two can't drift apart.
+
+| Category      | Vectors                                                                                             |
+|---------------|----------------------------------------------------------------------------------------------------|
+| Flood         | SYN, UDP, ICMP, ACK, RST, XMAS, NULL, FIN, Zero-Window, MAC, Smurf, LAND, SCTP INIT, Teardrop, PoD, GRE |
+| Reflection    | DNS, NTP, SNMP, Memcached, SSDP, CHARGEN                                                             |
+| Application   | Slowloris, HTTP flood, RUDY, Slow Read, HTTP/2 rapid reset, WebSocket flood                          |
+| Layer 2       | ARP poison, VLAN double-tag, CDP/LLDP/STP flood, DHCP starvation                                     |
+| IPv6 ND       | RA flood, NA flood, NS flood                                                                         |
+| Name poison   | LLMNR, NBT-NS, mDNS                                                                                  |
+| Wireless      | Deauth, Beacon flood, WPA handshake capture                                                          |
+| Recon/replay  | SSDP discovery, RADIUS PoD, cloud-IP lookup, HTTP throughput, PCAP replay                            |
+| Monitoring    | Passive credential sniff, traffic monitor, bandwidth meter, connection table                        |
+| Ext. tools    | `nmap`, `sqlmap` wrappers                                                                            |
+| Social        | Credential-harvest web server                                                                       |
 
 ### Reconnaissance
 - Async TCP port scanner (concurrent, semaphore-gated)
-- OS fingerprinting via TTL + banner grab
-- ARP/ICMP network topology mapping
+- OS fingerprinting via TTL + concurrent banner grab
+- ARP/ICMP topology mapping (batched, not host-by-host)
 - DNS lookup, reverse DNS, zone transfer attempts
 - Banner-based vulnerability detection
 
 ### Penetration Testing
 - SSH / FTP brute force (streaming wordlist, async)
 - HTTP Basic auth brute force
-- SQL injection, XSS, LFI, SSRF, command injection probes
-- SSH interactive shell
+- `sshexec` — run a single command over SSH with recovered credentials
+- SQL injection, reflected XSS, LFI, SSRF, command injection probes
+  (signature-based, not naive substring matching)
 
 ### Monitoring
 - Live traffic monitor (packet capture)
@@ -51,11 +61,10 @@ defend against them.
 - Passive credential capture (authorized network audits)
 
 ### Other
-- Cloud provider IP detection (AWS/Azure/GCP)
-- HTML session report generation
+- Cloud provider IP detection (AWS / Azure / GCP / …)
+- HTML session report (`report save`)
 - Phishing simulation server (authorized red team exercises only)
-- Reverse shell payload generation
-- Persistence payload generation
+- `payload revshell` / `payload persist` one-liner generators
 
 ---
 

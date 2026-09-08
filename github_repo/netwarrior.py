@@ -16,7 +16,7 @@ import collections
 import datetime
 import asyncio
 import importlib.util
-from typing import Optional, Dict, List, Iterable
+from typing import Optional, Dict, List, Iterable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from io import StringIO
@@ -1337,40 +1337,6 @@ class Attacks:
         att.stop()
         return att
 
-    # ---- SSHTunnel (connection check only; port forwarding not implemented) ----
-    async def ssh_tunnel(self, host, username, password=None, keyfile=None,
-                         remote_port=22, local_port=1080, duration=30, **kwargs):
-        att = self.registry.create("ssh_tunnel")
-        self.log.add(f"SSH tunnel {host}:{remote_port} (connection check only)", tag="TUNNEL")
-
-        def connect():
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            if password:
-                client.connect(host, port=remote_port, username=username,
-                               password=password, timeout=5, allow_agent=False, look_for_keys=False)
-            elif keyfile:
-                client.connect(host, port=remote_port, username=username,
-                               key_filename=keyfile, timeout=5)
-            else:
-                raise ValueError("password or keyfile required")
-            return client
-
-        loop = asyncio.get_running_loop()
-        try:
-            client = await loop.run_in_executor(None, connect)
-        except Exception as e:
-            self.log.add(f"SSH tunnel error: {e}", level="error")
-            att.stop()
-            return att
-        self.log.add("SSH connection established (port forwarding not implemented)", tag="TUNNEL")
-        try:
-            await self._sleep(att, duration)
-        finally:
-            await loop.run_in_executor(None, client.close)
-            att.stop()
-        return att
-
     # ---- Passive Capture ----
     async def passive_capture(self, interface=None, duration=30, **kwargs):
         name = "passive_capture"
@@ -1630,29 +1596,36 @@ class Attacks:
         att.stop()
         return att
 
-    # ---- Exploit Engine (Interactive SSH) ----
-    async def exploit_ssh(self, host, port=22, username=None, password=None, keyfile=None, **kwargs):
-        name = "exploit_ssh"
-        att = self.registry.create(name)
-        self.log.add(f"Launching SSH interactive shell to {host}:{port}", tag="EXPLOIT")
-        try:
+    # ---- SSH command execution (post-brute credential validation) ----
+    async def exploit_ssh(self, host, port=22, username=None, password=None,
+                          keyfile=None, command="id", **kwargs):
+        att = self.registry.create("ssh_exec")
+        self.log.add(f"SSH exec on {host}:{port} as {username}: {command!r}", tag="EXPLOIT")
+
+        def run():
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            if password:
-                client.connect(host, port=port, username=username, password=password, timeout=5)
-            elif keyfile:
-                client.connect(host, port=port, username=username, key_filename=keyfile, timeout=5)
-            else:
-                self.log.add("SSH shell requires credentials", level="error")
-                att.stop()
-                return att
-            stdin, stdout, stderr = client.exec_command("id")
-            output = stdout.read().decode()
-            self.log.add(f"SSH command output: {output}", tag="EXPLOIT")
-            att.add_finding({"output": output})
-            client.close()
+            try:
+                if password:
+                    client.connect(host, port=port, username=username, password=password,
+                                   timeout=5, allow_agent=False, look_for_keys=False)
+                elif keyfile:
+                    client.connect(host, port=port, username=username,
+                                   key_filename=keyfile, timeout=5)
+                else:
+                    raise ValueError("password or keyfile required")
+                _, stdout, stderr = client.exec_command(command, timeout=10)
+                return stdout.read().decode(errors="replace"), stderr.read().decode(errors="replace")
+            finally:
+                client.close()
+
+        try:
+            out, err = await asyncio.get_running_loop().run_in_executor(None, run)
+            self.log.add(f"SSH exec output: {out.strip()[:200]}", tag="EXPLOIT")
+            att.add_finding({"host": host, "user": username, "command": command,
+                             "stdout": out, "stderr": err})
         except Exception as e:
-            self.log.add(f"SSH exploit error: {e}", level="error")
+            self.log.add(f"SSH exec error: {e}", level="error")
         att.stop()
         return att
 
@@ -1698,13 +1671,6 @@ class Attacks:
             except Exception as e:
                 self.log.add(f"{att.name}: capture failed ({e})", level="error")
                 return
-
-    # ---- AutoEscalate (stub) ----
-    async def auto_escalate(self, target=None, **kwargs):
-        att = self.registry.create("auto_escalate")
-        self.log.add("Auto-escalate is not implemented", level="warn", tag="ESCALATE")
-        att.stop()
-        return att
 
     # ---- Traffic Monitor ----
     async def traffic_monitor(self, interface=None, duration=30, **kwargs):
@@ -1777,13 +1743,6 @@ class Attacks:
         cap = StringIO()
         Console(file=cap, highlight=False, width=100).print(table)
         att.add_finding({"table": cap.getvalue()})
-        att.stop()
-        return att
-
-    # ---- Stubs: declared in the dispatch table but not implemented ----
-    async def chaos_mode(self, target=None, duration=30, **kwargs):
-        att = self.registry.create("chaos")
-        self.log.add("Chaos mode is not implemented", level="warn", tag="CHAOS")
         att.stop()
         return att
 
@@ -2196,6 +2155,192 @@ class Report:
             log_bus.add(f"Report save failed: {e}", level="error", tag="REPORT")
             return None
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ATTACK CATALOG
+#
+# One source of truth for the `attack` command and the ATTACK menu, so the two
+# can never drift apart. Each entry knows its category, a one-line description,
+# the argument shape shown in the menu, whether it needs a target, and how to
+# build its coroutine from the parsed command arguments.
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class AttackArgs:
+    target: str
+    port: int
+    duration: int
+    pps: int
+    iface: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AttackSpec:
+    key: str
+    category: str
+    desc: str
+    args: str                       # human-readable arg hint for the menu
+    needs_target: bool
+    make: Callable                  # (Attacks, AttackArgs) -> coroutine
+
+
+def _mon_iface(x: AttackArgs) -> str:
+    return x.iface or "wlan0mon"
+
+
+ATTACK_CATALOG = [
+    # ── Volumetric floods: attack <cmd> <target> [port] [dur] [pps] ───────────
+    AttackSpec("syn",  "flood", "TCP SYN flood",         "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.syn_flood(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("udp",  "flood", "UDP flood",             "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.udp_flood(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("ack",  "flood", "TCP ACK flood",         "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.tcp_ack_flood(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("rst",  "flood", "TCP RST flood",         "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.tcp_rst_flood(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("xmas", "flood", "TCP XMAS flood",        "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.tcp_xmas_flood(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("null", "flood", "TCP NULL flood",        "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.tcp_null_flood(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("fin",  "flood", "TCP FIN flood",         "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.tcp_fin_flood(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("zero", "flood", "TCP zero-window",       "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.tcp_zero_window(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("land", "flood", "LAND (spoofed self-connect)", "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.land(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("sctp", "flood", "SCTP INIT flood",       "<target> [port] [dur] [pps]", True,
+               lambda a, x: a.sctp_init_flood(x.target, x.port, x.duration, x.pps)),
+    AttackSpec("icmp", "flood", "ICMP echo flood",       "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.icmp_flood(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("smurf", "flood", "Smurf broadcast reflection", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.smurf(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("mac",  "flood", "Switch CAM/MAC flood",  "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.mac_flood(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("teardrop", "flood", "Overlapping IP fragments", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.teardrop(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("pod",  "flood", "Ping of Death (oversized)", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.ping_of_death(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("gre",  "flood", "GRE-tunnelled spoofed IP", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.gre_ip_spoof(x.target, duration=x.duration, pps=x.pps)),
+    # ── Reflection / amplification ──────────────────────────────────────────
+    AttackSpec("dnsamp",    "amp", "DNS reflection",     "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.dns_amp(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("ntpamp",    "amp", "NTP monlist reflection", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.ntp_amp(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("snmpamp",   "amp", "SNMP GetBulk reflection", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.snmp_amp(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("memcached", "amp", "Memcached UDP reflection", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.memcached_amp(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("ssdpamp",   "amp", "SSDP/UPnP reflection", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.ssdp_amp(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("chargen",   "amp", "CHARGEN reflection", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.chargen_amp(x.target, duration=x.duration, pps=x.pps)),
+    # ── Application layer: attack <cmd> <target> [port] [dur] ────────────────
+    AttackSpec("slowloris",  "app", "Slowloris (partial headers)", "<target> [port] [dur]", True,
+               lambda a, x: a.slowloris(x.target, port=x.port, duration=x.duration)),
+    AttackSpec("http",       "app", "HTTP request flood", "<target> [port] [dur]", True,
+               lambda a, x: a.http_flood(x.target, port=x.port, duration=x.duration)),
+    AttackSpec("rudy",       "app", "R-U-Dead-Yet (slow POST)", "<target> [port] [dur]", True,
+               lambda a, x: a.rudy_attack(x.target, port=x.port, duration=x.duration)),
+    AttackSpec("slowread",   "app", "Slow response read", "<target> [port] [dur]", True,
+               lambda a, x: a.slow_read(x.target, port=x.port, duration=x.duration)),
+    AttackSpec("http2reset", "app", "HTTP/2 rapid reset pattern", "<target> [port] [dur]", True,
+               lambda a, x: a.http2_rapid_reset(x.target, port=x.port, duration=x.duration)),
+    AttackSpec("ws",         "app", "WebSocket handshake flood", "<target> [port] [dur]", True,
+               lambda a, x: a.websocket_flood(x.target, port=x.port, duration=x.duration)),
+    # ── Layer 2 / LAN ──────────────────────────────────────────────────────
+    AttackSpec("arp",   "l2", "ARP cache poison (MITM)", "<target> [_] [dur]", True,
+               lambda a, x: a.arp_poison(x.target, duration=x.duration)),
+    AttackSpec("vlan",  "l2", "802.1Q double-tagging",  "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.vlan_double_tag(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("l2cdp", "l2", "CDP frame flood",        "[_] [_] [dur] [pps]", False,
+               lambda a, x: a.l2_protocol_flood("cdp", duration=x.duration, pps=x.pps)),
+    AttackSpec("l2lldp", "l2", "LLDP frame flood",      "[_] [_] [dur] [pps]", False,
+               lambda a, x: a.l2_protocol_flood("lldp", duration=x.duration, pps=x.pps)),
+    AttackSpec("l2stp", "l2", "STP BPDU flood",         "[_] [_] [dur] [pps]", False,
+               lambda a, x: a.l2_protocol_flood("stp", duration=x.duration, pps=x.pps)),
+    AttackSpec("dhcp",  "l2", "DHCP pool starvation",   "[_] [_] [dur] [pps]", False,
+               lambda a, x: a.dhcp_starvation(duration=x.duration, pps=x.pps)),
+    # ── IPv6 neighbor discovery ────────────────────────────────────────────
+    AttackSpec("ipv6ra", "ipv6", "Rogue RA flood", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.ipv6_ra_flood(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("ipv6na", "ipv6", "Neighbor Advert. flood", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.ipv6_na_flood(x.target, duration=x.duration, pps=x.pps)),
+    AttackSpec("ipv6ns", "ipv6", "Neighbor Solicitation flood", "<target> [_] [dur] [pps]", True,
+               lambda a, x: a.ipv6_ns_flood(x.target, duration=x.duration, pps=x.pps)),
+    # ── Name-resolution poisoning ─────────────────────────────────────────
+    AttackSpec("llmnr", "poison", "LLMNR response poison", "<redirect-ip> [_] [dur]", True,
+               lambda a, x: a.llmnr_poison(x.target, duration=x.duration)),
+    AttackSpec("nbns",  "poison", "NBT-NS response poison", "<redirect-ip> [_] [dur]", True,
+               lambda a, x: a.nbns_poison(x.target, duration=x.duration)),
+    AttackSpec("mdns",  "poison", "mDNS response poison", "<redirect-ip> [_] [dur]", True,
+               lambda a, x: a.mdns_poison(x.target, duration=x.duration)),
+    # ── Wireless (needs a monitor-mode interface) ─────────────────────────
+    AttackSpec("deauth", "wifi", "802.11 deauth", "<bssid> [_] [dur] [pps]", True,
+               lambda a, x: a.deauth(x.target, iface=_mon_iface(x), duration=x.duration, pps=x.pps)),
+    AttackSpec("beacon", "wifi", "Fake AP beacon flood", "[_] [_] [dur] [pps]", False,
+               lambda a, x: a.beacon_flood(iface=_mon_iface(x), duration=x.duration, pps=x.pps)),
+    # ── Recon / discovery / replay ───────────────────────────────────────
+    AttackSpec("ssdpdiscovery", "recon", "SSDP M-SEARCH sweep", "[_] [_] [dur]", False,
+               lambda a, x: a.ssdp_discovery(duration=x.duration)),
+    AttackSpec("radiuspod", "recon", "RADIUS PoD broadcast", "[_] [_] [dur]", False,
+               lambda a, x: a.radius_pod(duration=x.duration)),
+    AttackSpec("cloud", "recon", "Cloud-provider IP lookup", "[target] [_] [dur]", False,
+               lambda a, x: a.cloud_recon(target_ips=[x.target] if x.target else None, duration=x.duration)),
+    AttackSpec("perf",  "recon", "HTTP throughput test", "<target> [port] [dur]", True,
+               lambda a, x: a.network_perf(x.target, port=x.port, duration=x.duration)),
+    AttackSpec("pcap",  "recon", "Replay a capture file", "<file.pcap> [_] [dur] [pps]", True,
+               lambda a, x: a.replay_pcap(x.target, duration=x.duration, pps=x.pps)),
+    # ── Monitoring ──────────────────────────────────────────────────────
+    AttackSpec("passive", "monitor", "Passive credential sniff", "[iface] [_] [dur]", False,
+               lambda a, x: a.passive_capture(interface=(x.target or x.iface), duration=x.duration)),
+    AttackSpec("traffic", "monitor", "Interface traffic monitor", "[iface] [_] [dur]", False,
+               lambda a, x: a.traffic_monitor(interface=(x.target or x.iface), duration=x.duration)),
+    AttackSpec("wirehand", "monitor", "WPA handshake capture", "[iface] [_] [dur]", False,
+               lambda a, x: a.wireless_handshake_capture(iface=_mon_iface(x), duration=x.duration)),
+    AttackSpec("bandwidth", "monitor", "Host bandwidth meter", "[_] [_] [dur]", False,
+               lambda a, x: a.bandwidth_meter(duration=x.duration)),
+    AttackSpec("conns", "monitor", "Active connection table", "", False,
+               lambda a, x: a.connection_table()),
+    # ── External tool wrappers ─────────────────────────────────────────
+    AttackSpec("nmap", "tool", "nmap -sV wrapper", "<target> [_] [dur]", True,
+               lambda a, x: a.nmap_wrapper(x.target, duration=max(x.duration, 60))),
+    AttackSpec("sqlmap", "tool", "sqlmap --batch wrapper", "<url> [_] [dur]", True,
+               lambda a, x: a.sqlmap_wrapper(x.target, duration=max(x.duration, 60))),
+    # ── Social engineering ────────────────────────────────────────────
+    AttackSpec("phish", "social", "Credential-harvest server", "[_] [port] [dur]", False,
+               lambda a, x: a.start_phishing_server(port=x.port, duration=x.duration)),
+]
+
+ATTACK_BY_KEY = {s.key: s for s in ATTACK_CATALOG}
+
+# Types that live under their own command instead of `attack`.
+ATTACK_REDIRECT = {
+    "sshbrute":  "sshbrute <host> <user> <wordlist>",
+    "ftpbrute":  "ftpbrute <host> <user> <wordlist>",
+    "httpbasic": "httpbasic <url> <userlist> <passlist>",
+    "sshexec":   "sshexec <host> <user> <password> [command]",
+    "ssrf":      "ssrf <url> <param>",
+    "cmdinj":    "cmdinj <url> <param>",
+    "sql":       "sql <url> <param>",
+    "xss":       "xss <url> <param>",
+    "lfi":       "lfi <url> <param>",
+}
+
+ATTACK_CATEGORY_COLOR = {
+    "flood":   "bright_red",
+    "amp":     "red",
+    "app":     "bright_yellow",
+    "l2":      "bright_magenta",
+    "ipv6":    "bright_blue",
+    "poison":  "magenta",
+    "wifi":    "bright_cyan",
+    "recon":   "cyan",
+    "monitor": "green",
+    "tool":    "bright_green",
+    "social":  "yellow",
+}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # UI – FULL INTERACTIVE WITH WORKING COMMAND MODE AND OUTPUT PANEL
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2577,12 +2722,12 @@ class UI:
         t.add_column("DESCRIPTION", style=self._c("desc"),    ratio=4)
 
         entries = [
-            ("1", "ATTACKS",  "attack",  "SYN / UDP / ICMP / AMP / App-layer / WiFi / L2 — 40+ vectors"),
+            ("1", "ATTACKS",  "attack",  f"Flood / reflect / L2 / IPv6 / WiFi / app-layer — {len(ATTACK_CATALOG)} vectors"),
             ("2", "RECON",    "recon",   "Port scan, OS fingerprint, DNS tools, vulnerability intel"),
-            ("3", "PENTEST",  "pentest", "SSH / FTP brute force, SQLi, XSS, LFI, SSRF, command injection"),
-            ("4", "REPORT",   "report",  "Live session report — packets sent, errors, active attacks"),
-            ("5", "CMD",      "command", "Direct command shell — type any command with full autocomplete"),
-            ("S", "STOP ALL", "attack",  "Terminate every running attack immediately"),
+            ("3", "PENTEST",  "pentest", "SSH / FTP brute force, SSH exec, SQLi, XSS, LFI, SSRF, cmd injection"),
+            ("4", "REPORT",   "report",  "Live session report; 'report save' writes an HTML file"),
+            ("5", "CMD",      "command", "Direct command shell — type any command and press Enter"),
+            ("S", "STOP ALL", "attack",  "Stop every running attack (engine stays up)"),
             ("Q", "QUIT",     "dim",     "Exit NetWARRIOR cleanly"),
         ]
         for key, label, ck, desc in entries:
@@ -2606,115 +2751,68 @@ class UI:
         )
 
     # ── Attack menu ───────────────────────────────────────────────────────────
+    _CAT_ORDER = ["flood", "amp", "app", "l2", "ipv6", "poison",
+                  "wifi", "recon", "monitor", "tool", "social"]
+    _CAT_LABEL = {
+        "flood": "FLOOD", "amp": "REFLECT", "app": "APP-LAYER", "l2": "LAYER 2",
+        "ipv6": "IPv6 ND", "poison": "NAME POISON", "wifi": "WIRELESS",
+        "recon": "RECON", "monitor": "MONITOR", "tool": "EXT TOOLS", "social": "SOCIAL",
+    }
+
+    def _attack_table(self, cats, with_args: bool) -> Table:
+        t = Table(box=box.SIMPLE, expand=True, padding=(0, 1), show_header=False,
+                  show_edge=False, pad_edge=False)
+        t.add_column("cmd", style=self._c("key"), no_wrap=True, min_width=10)
+        t.add_column("desc", style=self._c("desc"), ratio=1)
+        if with_args:
+            t.add_column("args", style=self._c("example"), no_wrap=True)
+        for ci, cat in enumerate(cats):
+            col = ATTACK_CATEGORY_COLOR.get(cat, "white")
+            if ci:
+                t.add_section()
+            head = [Text(self._CAT_LABEL.get(cat, cat.upper()), style=f"bold {col}"), Text("")]
+            if with_args:
+                head.append(Text(""))
+            t.add_row(*head)
+            for spec in ATTACK_CATALOG:
+                if spec.category != cat:
+                    continue
+                row = [Text(f"  {spec.key}", style=f"bold {col}"), Text(spec.desc)]
+                if with_args:
+                    row.append(Text(spec.args))
+                t.add_row(*row)
+        return t
+
     def _render_attack_menu(self, cols: int) -> Panel:
         pb = self._panel_box()
+        cats = [c for c in self._CAT_ORDER if any(s.category == c for s in ATTACK_CATALOG)]
 
-        # (category, command, description)
-        attacks = [
-            ("FLOOD",  "syn",        "SYN flood"),
-            ("FLOOD",  "udp",        "UDP flood"),
-            ("FLOOD",  "icmp",       "ICMP flood"),
-            ("FLOOD",  "ack",        "TCP ACK flood"),
-            ("FLOOD",  "rst",        "TCP RST flood"),
-            ("FLOOD",  "xmas",       "TCP XMAS flood"),
-            ("FLOOD",  "null",       "TCP NULL flood"),
-            ("FLOOD",  "fin",        "TCP FIN flood"),
-            ("FLOOD",  "zero",       "TCP Zero-Window"),
-            ("FLOOD",  "mac",        "MAC flood"),
-            ("FLOOD",  "smurf",      "Smurf attack"),
-            ("FLOOD",  "land",       "LAND attack"),
-            ("FLOOD",  "sctp",       "SCTP INIT flood"),
-            ("FLOOD",  "teardrop",   "Teardrop"),
-            ("FLOOD",  "pod",        "Ping of Death"),
-            ("AMP",    "dnsamp",     "DNS amplification"),
-            ("AMP",    "ntpamp",     "NTP amplification"),
-            ("AMP",    "snmpamp",    "SNMP amplification"),
-            ("AMP",    "memcached",  "Memcached amplification"),
-            ("AMP",    "ssdpamp",    "SSDP amplification"),
-            ("AMP",    "chargen",    "Chargen amplification"),
-            ("APP",    "slowloris",  "Slowloris"),
-            ("APP",    "http",       "HTTP flood"),
-            ("APP",    "rudy",       "RUDY"),
-            ("APP",    "slowread",   "Slow Read"),
-            ("APP",    "http2reset", "HTTP/2 rapid reset"),
-            ("APP",    "ws",         "WebSocket flood"),
-            ("L2",     "arp",        "ARP poison"),
-            ("L2",     "vlan",       "VLAN double-tag"),
-            ("L2",     "l2cdp",      "CDP flood"),
-            ("L2",     "l2lldp",     "LLDP flood"),
-            ("L2",     "l2stp",      "STP flood"),
-            ("IPV6",   "ipv6ra",     "IPv6 RA flood"),
-            ("IPV6",   "ipv6na",     "IPv6 NA flood"),
-            ("IPV6",   "ipv6ns",     "IPv6 NS flood"),
-            ("WIFI",   "deauth",     "Deauth attack"),
-            ("WIFI",   "beacon",     "Beacon flood"),
-            ("MISC",   "gre",        "GRE IP spoof"),
-            ("MISC",   "pcap",       "PCAP replay"),
-            ("MISC",   "llmnr",      "LLMNR poison"),
-            ("MISC",   "nbns",       "NBNS poison"),
-            ("MISC",   "mdns",       "mDNS poison"),
-            ("MISC",   "dhcp",       "DHCP starvation"),
-            ("MISC",   "phish",      "Phishing server"),
-            ("MISC",   "cloud",      "Cloud recon"),
-            ("MISC",   "passive",    "Passive capture"),
-            ("MISC",   "traffic",    "Traffic monitor"),
-            ("MISC",   "bandwidth",  "Bandwidth meter"),
-            ("MISC",   "conns",      "Connection table"),
-        ]
-
-        cat_col = {
-            "FLOOD": "bright_red",
-            "AMP":   "red",
-            "APP":   "bright_yellow",
-            "L2":    "bright_magenta",
-            "IPV6":  "bright_blue",
-            "WIFI":  "bright_cyan",
-            "MISC":  "grey62",
-        }
-
-        if cols >= 120:
-            # Two-column layout for wide terminals
-            t = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
-            for _ in range(2):
-                t.add_column("CAT",  style=self._c("category"), width=6, no_wrap=True)
-                t.add_column("CMD",  style=self._c("key"),       width=12, no_wrap=True)
-                t.add_column("DESC", style=self._c("desc"),      ratio=1)
-
-            half = (len(attacks) + 1) // 2
-            left, right = attacks[:half], attacks[half:]
-            for i, (lc, lk, ld) in enumerate(left):
-                lcat = Text(lc, style=cat_col.get(lc, "white"))
-                lkey = Text(lk, style=f"bold {cat_col.get(lc, 'white')}")
-                ldesc= Text(ld)
-                if i < len(right):
-                    rc, rk, rd = right[i]
-                    rcat = Text(rc, style=cat_col.get(rc, "white"))
-                    rkey = Text(rk, style=f"bold {cat_col.get(rc, 'white')}")
-                    rdesc= Text(rd)
-                    t.add_row(lcat, lkey, ldesc, rcat, rkey, rdesc)
-                else:
-                    t.add_row(lcat, lkey, ldesc, Text(""), Text(""), Text(""))
+        if cols >= 104:
+            counts = {c: sum(s.category == c for s in ATTACK_CATALOG) + 1 for c in cats}
+            total = sum(counts.values())
+            left, right, acc = [], [], 0
+            for c in cats:
+                (left if acc < total / 2 else right).append(c)
+                acc += counts[c]
+            with_args = cols >= 132
+            grid = Table.grid(expand=True, padding=(0, 3))
+            grid.add_column(ratio=1)
+            grid.add_column(ratio=1)
+            grid.add_row(self._attack_table(left, with_args), self._attack_table(right, with_args))
+            body = grid
         else:
-            t = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
-            t.add_column("CAT",  style=self._c("category"), width=6, no_wrap=True)
-            t.add_column("CMD",  style=self._c("key"),       width=12, no_wrap=True)
-            t.add_column("DESC", style=self._c("desc"),      ratio=1)
-            for cat, key, desc in attacks:
-                col = cat_col.get(cat, "white")
-                t.add_row(
-                    Text(cat, style=col),
-                    Text(key, style=f"bold {col}"),
-                    Text(desc),
-                )
+            body = self._attack_table(cats, cols >= 74)
 
         hint = Text(
-            "\n  Usage:   attack <cmd> <target> [port] [duration] [pps]\n"
-            "  Example: attack syn 192.168.1.1 80 30 1000\n",
+            f"\n  {len(ATTACK_CATALOG)} vectors    "
+            "attack <cmd> <target> [port] [duration] [pps]    "
+            "([_] = arg ignored for that vector)\n"
+            "  e.g.  attack syn 192.168.1.1 80 30 1000        'stop' ends every running attack\n",
             style=self._c("dim"),
         )
         return Panel(
-            Group(t, hint),
-            title=f"[bold {self._c('attack')}]ATTACK MENU[/]",
+            Group(body, hint),
+            title=f"[bold {self._c('attack')}]ATTACK MENU  ({len(ATTACK_CATALOG)} vectors)[/]",
             border_style=self._c("attack"),
             box=pb,
             padding=(0, 1),
@@ -2760,14 +2858,15 @@ class UI:
         t.add_column("EXAMPLE",                              style=self._c("example"), ratio=4)
 
         rows = [
-            ("sshbrute <host> <user> <wordlist>",            "SSH brute force",        "sshbrute 10.0.0.1 root /usr/share/wordlists/rockyou.txt"),
-            ("ftpbrute <host> <user> <wordlist>",            "FTP brute force",        "ftpbrute 10.0.0.1 anonymous /tmp/pass.txt"),
-            ("httpbasic <url> <userlist> <passlist>",         "HTTP Basic auth brute",  "httpbasic http://10.0.0.1 users.txt pass.txt"),
-            ("sql <url> <param>",                            "SQL injection probe",    "sql http://10.0.0.1/page id"),
-            ("xss <url> <param>",                            "XSS probe",              "xss http://10.0.0.1/search q"),
-            ("lfi <url> <param>",                            "LFI path traversal",     "lfi http://10.0.0.1/view file"),
-            ("ssrf <url> <param>",                           "SSRF probe",             "ssrf http://10.0.0.1/fetch url"),
-            ("cmdinj <url> <param>",                         "Command injection probe","cmdinj http://10.0.0.1/run cmd"),
+            ("sshbrute <host> <user> <wordlist>",             "SSH brute force",         "sshbrute 10.0.0.1 root rockyou.txt"),
+            ("sshexec <host> <user> <pass> [cmd]",            "Run a command over SSH",  "sshexec 10.0.0.1 root hunter2 'id'"),
+            ("ftpbrute <host> <user> <wordlist>",             "FTP brute force",         "ftpbrute 10.0.0.1 anonymous pass.txt"),
+            ("httpbasic <url> <userlist> <passlist>",         "HTTP Basic auth brute",   "httpbasic http://10.0.0.1 users.txt pass.txt"),
+            ("sql <url> <param>",                             "SQL injection probe",     "sql http://10.0.0.1/page id"),
+            ("xss <url> <param>",                             "Reflected XSS probe",     "xss http://10.0.0.1/search q"),
+            ("lfi <url> <param>",                             "LFI / path traversal",    "lfi http://10.0.0.1/view file"),
+            ("ssrf <url> <param>",                            "SSRF probe",              "ssrf http://10.0.0.1/fetch url"),
+            ("cmdinj <url> <param>",                          "Command injection probe", "cmdinj http://10.0.0.1/run cmd"),
         ]
         for cmd, desc, ex in rows:
             t.add_row(cmd, desc, ex)
@@ -2840,7 +2939,8 @@ class UI:
             ("dns <domain> / dnsrev <ip>",         "Forward / reverse DNS lookup"),
             ("zone <domain> <server>",             "DNS zone transfer attempt"),
             ("vuln <ip>",                          "Vulnerability check against banners"),
-            ("sshbrute / ftpbrute / httpbasic",    "Credential brute force attacks"),
+            ("sshbrute / ftpbrute / httpbasic",    "Credential brute force"),
+            ("sshexec <host> <user> <pass> [cmd]", "Run one command over SSH"),
             ("sql / xss / lfi / ssrf / cmdinj",    "Web application vulnerability probes"),
             ("attack <type> <target> [port] [dur] [pps]", "Launch an attack (see ATTACK menu)"),
             ("list",                               "List active attacks"),
@@ -3062,6 +3162,17 @@ class UI:
                         if found
                         else "[yellow]No password found[/]"
                     )
+            elif command == "sshexec":
+                if len(args) < 3:
+                    output = "[red]Usage: sshexec <host> <user> <password> [command][/]"
+                else:
+                    command_str = " ".join(args[3:]) or "id"
+                    att = await self.attacks.exploit_ssh(
+                        args[0], username=args[1], password=args[2], command=command_str)
+                    if att.findings:
+                        output = f"[green]{args[0]} $ {command_str}[/]\n{att.findings[0]['stdout']}"
+                    else:
+                        output = "[yellow]SSH exec failed — see logs[/]"
             elif command == "ftpbrute":
                 if len(args) < 3:
                     output = "[red]Usage: ftpbrute <host> <user> <wordlist>[/]"
@@ -3202,94 +3313,17 @@ class UI:
     # ── Attack coroutine builder ──────────────────────────────────────────────
     def _build_attack(self, atype, target, port, duration, pps):
         """
-        Return ``(coroutine, needs_target)`` for an ``attack`` command.
+        Return ``(coroutine, needs_target)`` for an ``attack`` command, using the
+        shared ATTACK_CATALOG so the command and the menu never disagree.
 
         Raises ``KeyError`` for an unknown type and ``ValueError`` for a type
         that has its own dedicated command instead.
         """
-        redirect = {
-            "sshbrute":   "sshbrute <host> <user> <wordlist>",
-            "ftpbrute":   "ftpbrute <host> <user> <wordlist>",
-            "httpbasic":  "httpbasic <url> <userlist> <passlist>",
-            "ssrf":       "ssrf <url> <param>",
-            "cmdinj":     "cmdinj <url> <param>",
-            "sql":        "sql <url> <param>",
-            "xss":        "xss <url> <param>",
-            "lfi":        "lfi <url> <param>",
-        }
-        if atype in redirect:
-            raise ValueError(f"'{atype}' has its own command:  {redirect[atype]}")
-
-        a = self.attacks
-        iface = self.config.interface
-        DP = dict(duration=duration, pps=pps)
-        D  = dict(duration=duration)
-        specs = {
-            # target + port + duration + pps
-            "syn":  (lambda: a.syn_flood(target, port, duration, pps), True),
-            "udp":  (lambda: a.udp_flood(target, port, duration, pps), True),
-            "ack":  (lambda: a.tcp_ack_flood(target, port, duration, pps), True),
-            "rst":  (lambda: a.tcp_rst_flood(target, port, duration, pps), True),
-            "xmas": (lambda: a.tcp_xmas_flood(target, port, duration, pps), True),
-            "null": (lambda: a.tcp_null_flood(target, port, duration, pps), True),
-            "fin":  (lambda: a.tcp_fin_flood(target, port, duration, pps), True),
-            "zero": (lambda: a.tcp_zero_window(target, port, duration, pps), True),
-            "land": (lambda: a.land(target, port, duration, pps), True),
-            "sctp": (lambda: a.sctp_init_flood(target, port, duration, pps), True),
-            # target + duration (+ pps)
-            "icmp":      (lambda: a.icmp_flood(target, **DP), True),
-            "smurf":     (lambda: a.smurf(target, **DP), True),
-            "mac":       (lambda: a.mac_flood(target, **DP), True),
-            "teardrop":  (lambda: a.teardrop(target, **DP), True),
-            "pod":       (lambda: a.ping_of_death(target, **DP), True),
-            "gre":       (lambda: a.gre_ip_spoof(target, **DP), True),
-            "vlan":      (lambda: a.vlan_double_tag(target, **DP), True),
-            "arp":       (lambda: a.arp_poison(target, **D), True),
-            "dnsamp":    (lambda: a.dns_amp(target, **DP), True),
-            "ntpamp":    (lambda: a.ntp_amp(target, **DP), True),
-            "snmpamp":   (lambda: a.snmp_amp(target, **DP), True),
-            "memcached": (lambda: a.memcached_amp(target, **DP), True),
-            "ssdpamp":   (lambda: a.ssdp_amp(target, **DP), True),
-            "chargen":   (lambda: a.chargen_amp(target, **DP), True),
-            "ipv6ra":    (lambda: a.ipv6_ra_flood(target, **DP), True),
-            "ipv6na":    (lambda: a.ipv6_na_flood(target, **DP), True),
-            "ipv6ns":    (lambda: a.ipv6_ns_flood(target, **DP), True),
-            "llmnr":     (lambda: a.llmnr_poison(target, **D), True),
-            "nbns":      (lambda: a.nbns_poison(target, **D), True),
-            "mdns":      (lambda: a.mdns_poison(target, **D), True),
-            "dhcp":      (lambda: a.dhcp_starvation(**D), False),
-            "deauth":    (lambda: a.deauth(target, iface=(iface or "wlan0mon"), **D), True),
-            # app layer: target + port + duration
-            "slowloris":  (lambda: a.slowloris(target, port=port, duration=duration), True),
-            "http":       (lambda: a.http_flood(target, port=port, duration=duration), True),
-            "rudy":       (lambda: a.rudy_attack(target, port=port, duration=duration), True),
-            "slowread":   (lambda: a.slow_read(target, port=port, duration=duration), True),
-            "http2reset": (lambda: a.http2_rapid_reset(target, port=port, duration=duration), True),
-            "ws":         (lambda: a.websocket_flood(target, port=port, duration=duration), True),
-            "perf":       (lambda: a.network_perf(target, port=port, duration=duration), True),
-            "pcap":       (lambda: a.replay_pcap(target, duration=duration, pps=pps), True),
-            "nmap":       (lambda: a.nmap_wrapper(target, duration=max(duration, 60)), True),
-            "sqlmap":     (lambda: a.sqlmap_wrapper(target, duration=max(duration, 60)), True),
-            "autoesc":    (lambda: a.auto_escalate(target), True),
-            "chaos":      (lambda: a.chaos_mode(target, duration=duration), True),
-            # no target required
-            "beacon":        (lambda: a.beacon_flood(iface=(iface or "wlan0mon"), duration=duration), False),
-            "ssdpdiscovery": (lambda: a.ssdp_discovery(duration=duration), False),
-            "radiuspod":     (lambda: a.radius_pod(duration=duration), False),
-            "bandwidth":     (lambda: a.bandwidth_meter(duration=duration), False),
-            "conns":         (lambda: a.connection_table(), False),
-            "cloud":         (lambda: a.cloud_recon(target_ips=[target] if target else None, duration=duration), False),
-            "phish":         (lambda: a.start_phishing_server(port=port, duration=duration), False),
-            "l2cdp":         (lambda: a.l2_protocol_flood("cdp", **DP), False),
-            "l2lldp":        (lambda: a.l2_protocol_flood("lldp", **DP), False),
-            "l2stp":         (lambda: a.l2_protocol_flood("stp", **DP), False),
-            # interface-scoped (an optional interface name may be given as target)
-            "passive":  (lambda: a.passive_capture(interface=(target or iface), duration=duration), False),
-            "traffic":  (lambda: a.traffic_monitor(interface=(target or iface), duration=duration), False),
-            "wirehand": (lambda: a.wireless_handshake_capture(iface=(target or iface or "wlan0mon"), duration=duration), False),
-        }
-        maker, needs_target = specs[atype]        # KeyError -> unknown type
-        return maker(), needs_target
+        if atype in ATTACK_REDIRECT:
+            raise ValueError(f"'{atype}' has its own command:  {ATTACK_REDIRECT[atype]}")
+        spec = ATTACK_BY_KEY[atype]        # KeyError -> unknown type
+        args = AttackArgs(target, port, duration, pps, self.config.interface)
+        return spec.make(self.attacks, args), spec.needs_target
 
     def _payload_command(self, args) -> str:
         if not args:
