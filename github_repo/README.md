@@ -14,7 +14,9 @@ interface for network stress testing, reconnaissance, vulnerability assessment, 
 application testing.
 
 Designed as a learning resource for understanding how network attacks work — and how to
-defend against them.
+defend against them. Every technique in the tool is paired with detection and
+mitigation guidance in **[DEFENSE.md](DEFENSE.md)**, plus a ready-to-load Suricata
+ruleset in [`detection/netwarrior.rules`](detection/netwarrior.rules).
 
 ---
 
@@ -214,6 +216,16 @@ reflection vectors just bounce back to you.
 | Windows 11            | Windows Terminal      | Full    |
 | Windows 10            | CMD (legacy)          | Partial |
 | macOS 14              | iTerm2                | Full    |
+
+---
+
+## Defending against it
+
+See **[DEFENSE.md](DEFENSE.md)** — for every attack category: what it looks like
+on the wire, how to detect it (commands, log patterns, NetFlow signatures), and
+how to mitigate it (kernel sysctls, `iptables`/switch config, reverse-proxy
+timeouts, WIDS, egress filtering). [`detection/netwarrior.rules`](detection/netwarrior.rules)
+is a Suricata ruleset tuned to this tool's exact payloads.
 
 ---
 
