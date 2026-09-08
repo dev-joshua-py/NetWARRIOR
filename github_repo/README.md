@@ -65,24 +65,27 @@ defend against them.
 netwarrior.py            — single-file, self-contained
 │
 ├── Core
-│   ├── Config           — Pydantic-style settings, TOML persistence
+│   ├── Config           — settings + TOML persistence, safe-mode / pps guard rails
 │   ├── NetworkContext   — Auto-detect IP, interface, gateway, DNS
 │   ├── AttackState      — Thread-safe per-attack metrics
-│   ├── AttackRegistry   — Lifecycle manager for all running attacks
+│   ├── AttackRegistry   — Lifecycle manager, retains session history
 │   ├── LogBus           — Structured log ring buffer (deque, 500 entries)
 │   ├── RateLimiter      — Token bucket, async-safe
-│   └── AttackEngine     — Async send loop, executor-bridged scapy
+│   └── AttackEngine     — Batched async send loop, executor-bridged scapy
 │
 ├── Attacks              — All 40+ attack implementations
 ├── Recon                — Port scan, fingerprint, DNS, vuln scan
 ├── Pentest              — Brute force, web vuln probes
-├── PostExploit          — Payload generators
-├── Report               — HTML report
+├── PostExploit          — Payload generators (`payload` command)
+├── Report               — HTML session report (`report save`)
 └── UI                   — Adaptive Rich TUI
 ```
 
-**Async-first.** `asyncio` + `uvloop` for all I/O. Blocking calls (scapy, paramiko) are
-wrapped in `loop.run_in_executor()` so the event loop never freezes.
+**Async-first.** `asyncio` (plus `uvloop` on Linux/macOS) for all I/O. Blocking calls
+(scapy sends, `sniff`, paramiko) run in `loop.run_in_executor()`, and packet sends are
+dispatched in small batches, so the event loop — and the `stop` command — stay
+responsive even at high packet rates. Attacks run as background tasks; launching one
+never blocks the UI, and `stop` ends running attacks without shutting the engine down.
 
 **Adaptive UI.** Detects terminal width at render time. Wide terminals (100+ cols) get a
 two-column attack menu and live stats sidebar. Narrow terminals stack single-column.
@@ -103,10 +106,14 @@ psutil>=5.9.0
 paramiko>=3.0.0
 dnspython>=2.2.0
 aiohttp>=3.9.0
-uvloop>=0.19.0
-tomli>=2.0.0
+tomli>=2.0.0             ; python_version < "3.11"
 tomli_w>=1.0.0
+uvloop>=0.19.0           ; sys_platform != "win32"
 ```
+
+`tomli` is only needed on Python 3.10 and below — 3.11+ uses the standard-library
+`tomllib`. `uvloop` is Linux/macOS only; on Windows the tool runs on the default
+event loop.
 
 ---
 
@@ -114,20 +121,18 @@ tomli_w>=1.0.0
 
 ```bash
 git clone https://github.com/dev-joshua-py/NetWARRIOR.git
-cd netwarrior
-cd github_repo
+cd NetWARRIOR/github_repo
 pip install -r requirements.txt
 
 # Linux — root required for raw packet injection
 sudo python3 netwarrior.py
 
-# Windows — run as Administrator, Npcap must be installed
-# https://npcap.com
-python patch.py
+# Windows — run as Administrator, Npcap must be installed (https://npcap.com)
 python netwarrior.py
 ```
 
-The tool auto-checks dependencies on launch and offers to install any that are missing.
+On launch the tool checks for missing dependencies and prints an install command
+if any are absent.
 
 ---
 
@@ -152,11 +157,17 @@ Commands (type directly, press Enter):
   sshbrute 10.0.0.1 root rockyou.txt   SSH brute force
   sql http://10.0.0.1/page id          SQL injection probe
 
+  payload revshell 10.0.0.1 4444       Generate a reverse-shell one-liner
   list                                 Active attacks
-  stop                                 Stop all
-  status                               Packet stats
+  stop                                 Stop all running attacks
+  status                               Packet / traffic stats
+  report save                          Write an HTML session report
   q                                    Quit
 ```
+
+`pps` is capped at `max_pps` (default 10000) from the config file. Set `safe_mode = true`
+in `~/.config/netwarrior/config.toml` (or `%APPDATA%\netwarrior\config.toml` on Windows)
+to block attacks aimed at loopback, multicast, or broadcast addresses.
 
 ---
 
