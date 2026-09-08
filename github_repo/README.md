@@ -131,17 +131,37 @@ event loop.
 ```bash
 git clone https://github.com/dev-joshua-py/NetWARRIOR.git
 cd NetWARRIOR/github_repo
-pip install -r requirements.txt
+pip install -r requirements.txt        # or:  pip install .
 
 # Linux — root required for raw packet injection
-sudo python3 netwarrior.py
+sudo python3 netwarrior.py             # or, after `pip install .`:  sudo netwarrior
 
 # Windows — run as Administrator, Npcap must be installed (https://npcap.com)
 python netwarrior.py
 ```
 
 On launch the tool checks for missing dependencies and prints an install command
-if any are absent.
+if any are absent. **The first interactive run prints the legal notice and asks
+you to type `I HAVE AUTHORIZATION` before it will start** (recorded in the config
+file; pass `--yes` to skip in automation).
+
+### Command-line options
+
+```
+netwarrior [--safe] [--scope CIDR ...] [--iface NAME] [--yes] [--no-audit]
+```
+
+| Flag            | Effect                                                                   |
+|-----------------|-------------------------------------------------------------------------|
+| `--safe`        | Force `safe_mode`: no source spoofing, reserved/loopback targets blocked |
+| `--scope CIDR`  | Refuse any target outside these networks (repeatable)                    |
+| `--iface NAME`  | Interface for packet injection                                           |
+| `--yes`         | Skip the first-run authorization prompt                                  |
+| `--no-audit`    | Do not append to `<output_dir>/audit.log`                                |
+
+Every attack launch, brute-force run and `sshexec` is appended to
+`reports/audit.log` as one JSON line (operator, UTC timestamp, target, params —
+never passwords) for engagement records.
 
 ---
 
@@ -166,6 +186,7 @@ Commands (type directly, press Enter):
   sshbrute 10.0.0.1 root rockyou.txt   SSH brute force
   sql http://10.0.0.1/page id          SQL injection probe
 
+  sshexec 10.0.0.1 root pw 'id'        Run a command over SSH
   payload revshell 10.0.0.1 4444       Generate a reverse-shell one-liner
   list                                 Active attacks
   stop                                 Stop all running attacks
@@ -174,9 +195,12 @@ Commands (type directly, press Enter):
   q                                    Quit
 ```
 
-`pps` is capped at `max_pps` (default 10000) from the config file. Set `safe_mode = true`
-in `~/.config/netwarrior/config.toml` (or `%APPDATA%\netwarrior\config.toml` on Windows)
-to block attacks aimed at loopback, multicast, or broadcast addresses.
+`pps` is capped at `max_pps` (default 10000). Config lives in
+`~/.config/netwarrior/config.toml` (or `%APPDATA%\netwarrior\config.toml` on
+Windows) — `safe_mode`, `scope` (a list of CIDRs), `spoof_source`, `interface`,
+`output_dir`, `audit_log` and more. In `safe_mode` the engine also rewrites
+forged source addresses back to your own, so floods stay attributable and
+reflection vectors just bounce back to you.
 
 ---
 
@@ -190,6 +214,22 @@ to block attacks aimed at loopback, multicast, or broadcast addresses.
 | Windows 11            | Windows Terminal      | Full    |
 | Windows 10            | CMD (legacy)          | Partial |
 | macOS 14              | iTerm2                | Full    |
+
+---
+
+## Development
+
+```bash
+pip install -e ".[dev]"      # from github_repo/
+ruff check .                  # lint
+python -m pyflakes netwarrior.py
+pytest -q                     # ~120 tests, no packets leave the machine
+```
+
+`tests/` mocks scapy's senders and sniffer, so the suite runs unprivileged and
+offline. CI (`.github/workflows/ci.yml`) runs ruff + pyflakes + pytest on Python
+3.11–3.13. The `attack` command and the ATTACK menu are both generated from
+`ATTACK_CATALOG` — add a vector there once and both pick it up.
 
 ---
 

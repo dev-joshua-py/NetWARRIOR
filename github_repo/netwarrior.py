@@ -1,28 +1,28 @@
-import os
-import sys
-import time
-import socket
-import random
-import re
-import json
-import getpass
 import argparse
-import threading
-import queue
-import shlex
-import shutil
-import subprocess
-import html
-import ipaddress
-import platform
+import asyncio
 import collections
 import datetime
-import asyncio
+import getpass
+import html
 import importlib.util
-from typing import Optional, Dict, List, Iterable, Callable
+import ipaddress
+import json
+import os
+import platform
+import queue
+import random
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from pathlib import Path
 from io import StringIO
+from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DEPENDENCY CHECK
@@ -41,8 +41,6 @@ _REQUIRED = {
     "aiohttp": "aiohttp",
     "tomli_w": "tomli_w",
 }
-if sys.version_info < (3, 11):
-    _REQUIRED["tomli"] = "tomli"
 
 
 def check_deps():
@@ -74,29 +72,60 @@ if sys.platform != "win32":
         pass
 
 import aiohttp
-import psutil
-import paramiko
+import dns.query
 import dns.resolver
 import dns.reversename
 import dns.zone
-import dns.query
+import paramiko
+import psutil
+from rich import box
 
 # Rich
 from rich.console import Console, Group
-from rich.table import Table
-from rich.panel import Panel
 from rich.layout import Layout
 from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
-from rich import box
 
 # Scapy
 from scapy.all import (
-    IP, TCP, UDP, ICMP, Ether, ARP, send, sendp, sniff, srp, sr, sr1,
-    rdpcap, fragment, Dot1Q, GRE, SCTP, SCTPChunkInit,
-    IPv6, ICMPv6ND_NA, ICMPv6ND_RA, ICMPv6ND_NS, ICMPv6NDOptSrcLLAddr,
-    DNS, DNSQR, DNSRR, RadioTap, Dot11, Dot11Deauth,
-    Dot11Beacon, Dot11Elt, LLC, Raw, EAPOL, BOOTP, DHCP,
+    ARP,
+    BOOTP,
+    DHCP,
+    DNS,
+    DNSQR,
+    DNSRR,
+    EAPOL,
+    GRE,
+    ICMP,
+    IP,
+    LLC,
+    SCTP,
+    TCP,
+    UDP,
+    Dot1Q,
+    Dot11,
+    Dot11Beacon,
+    Dot11Deauth,
+    Dot11Elt,
+    Ether,
+    ICMPv6ND_NA,
+    ICMPv6ND_NS,
+    ICMPv6ND_RA,
+    ICMPv6NDOptSrcLLAddr,
+    IPv6,
+    RadioTap,
+    Raw,
+    SCTPChunkInit,
+    fragment,
+    rdpcap,
+    send,
+    sendp,
+    sniff,
+    sr,
+    sr1,
+    srp,
 )
 
 console = Console()
@@ -131,8 +160,10 @@ class Utils:
     def format_duration(seconds):
         m, s = divmod(int(seconds), 60)
         h, m = divmod(m, 60)
-        if h: return f"{h}h {m}m {s}s"
-        if m: return f"{m}m {s}s"
+        if h:
+            return f"{h}h {m}m {s}s"
+        if m:
+            return f"{m}m {s}s"
         return f"{s}s"
     @staticmethod
     def get_hostname(ip):
@@ -277,7 +308,7 @@ class Config:
                 pass
         return nets
 
-    def check_target(self, target: str) -> Optional[str]:
+    def check_target(self, target: str) -> str | None:
         """
         Return a rejection reason (str) if this target is not allowed, else None.
         Enforces the scope allowlist always, and the reserved-address blocks
@@ -351,7 +382,7 @@ class NetworkContext:
                 pass
         self.gateway = Utils.get_default_gateway()
         try:
-            with open('/etc/resolv.conf', 'r') as f:
+            with open('/etc/resolv.conf') as f:
                 dns = [line.split()[1] for line in f if line.startswith('nameserver')]
                 if dns:
                     self.dns_servers = dns
@@ -367,9 +398,9 @@ class AttackState:
     bytes_sent: int = 0
     bytes_recv: int = 0
     start_time: float = field(default_factory=time.time)
-    end_time: Optional[float] = None
+    end_time: float | None = None
     errors: int = 0
-    findings: List[Dict] = field(default_factory=list)
+    findings: list[dict] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def inc_sent(self, n=1):
@@ -402,7 +433,7 @@ class AttackState:
 
 class AttackRegistry:
     def __init__(self):
-        self._attacks: "collections.OrderedDict[str, AttackState]" = collections.OrderedDict()
+        self._attacks: collections.OrderedDict[str, AttackState] = collections.OrderedDict()
         self._lock = threading.Lock()
 
     def create(self, name) -> AttackState:
@@ -422,7 +453,7 @@ class AttackRegistry:
         with self._lock:
             return self._attacks.get(name)
 
-    def snapshot(self) -> "List[AttackState]":
+    def snapshot(self) -> "list[AttackState]":
         with self._lock:
             return list(self._attacks.values())
 
@@ -481,7 +512,7 @@ class AuditLog:
         if not self.config.audit_log:
             return
         entry = {
-            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "ts": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
             "operator": self.operator,
             "action": action,
             **{k: v for k, v in fields.items() if v not in (None, "")},
@@ -548,7 +579,7 @@ class AttackEngine:
         """Global shutdown. Use registry.stop_all() to stop attacks without quitting."""
         self._stop.set()
 
-    def _resolve_iface(self, iface: Optional[str]) -> Optional[str]:
+    def _resolve_iface(self, iface: str | None) -> str | None:
         return iface or self.config.interface or None
 
     def _despoof(self, pkt):
@@ -568,7 +599,7 @@ class AttackEngine:
 
     async def send_loop(self, packet_gen: Iterable, duration: float, pps: int,
                         att: "AttackState", layer2: bool = False,
-                        iface: Optional[str] = None):
+                        iface: str | None = None):
         """
         Pull packets from `packet_gen` and transmit them at `pps` for `duration`
         seconds. Transmission is dispatched to a worker thread in small batches so
@@ -1105,8 +1136,7 @@ class Attacks:
             self.log.add(f"Replaying {pcap_file} ({len(packets)} packets)", tag="ATTACK")
             def gen():
                 while True:
-                    for pkt in packets:
-                        yield pkt
+                    yield from packets
             await self.engine.send_loop(gen(), duration, pps, att)
         except Exception as e:
             self.log.add(f"Replay error: {e}", level="error")
@@ -1516,7 +1546,7 @@ class Attacks:
             return
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.communicate()
             self.log.add(f"{tool}: timed out after {timeout}s, process killed", level="warn")
@@ -1583,7 +1613,7 @@ class Attacks:
                 except Exception:
                     pass
 
-        with open(wordlist_path, 'r') as f:
+        with open(wordlist_path) as f:
             tasks = []
             for line in f:
                 pwd = line.strip()
@@ -1629,12 +1659,12 @@ class Attacks:
                 except Exception:
                     pass
 
-        with open(user_wordlist, 'r') as uf:
+        with open(user_wordlist) as uf:
             for user in uf:
                 user = user.strip()
                 if not user:
                     continue
-                with open(pass_wordlist, 'r') as pf:
+                with open(pass_wordlist) as pf:
                     tasks = []
                     for pwd in pf:
                         pwd = pwd.strip()
@@ -1874,8 +1904,8 @@ class Recon:
         self.log = log
         self.loop = asyncio.get_running_loop()
 
-    async def port_scan(self, host: str, ports: List[int], concurrency: int = 200,
-                        timeout: float = 2.0) -> List[int]:
+    async def port_scan(self, host: str, ports: list[int], concurrency: int = 200,
+                        timeout: float = 2.0) -> list[int]:
         sem = asyncio.Semaphore(concurrency)
         async def scan_one(p):
             async with sem:
@@ -1893,7 +1923,7 @@ class Recon:
         results = await asyncio.gather(*(scan_one(p) for p in ports))
         return sorted(p for p in results if p is not None)
 
-    async def _banner(self, ip: str, port: int, timeout: float = 2.0) -> Optional[str]:
+    async def _banner(self, ip: str, port: int, timeout: float = 2.0) -> str | None:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, port), timeout=timeout)
@@ -1914,7 +1944,7 @@ class Recon:
             except Exception:
                 pass
 
-    async def fingerprint(self, ip: str) -> Dict:
+    async def fingerprint(self, ip: str) -> dict:
         result = {"ip": ip, "ports": [], "banners": {}, "os": "Unknown", "ttl": None}
 
         def _icmp_ttl():
@@ -1940,11 +1970,11 @@ class Recon:
                 result["os"] = "Network device"
         result["ports"] = ports
         banners = await asyncio.gather(*(self._banner(ip, p) for p in ports))
-        result["banners"] = {p: b for p, b in zip(ports, banners) if b}
+        result["banners"] = {p: b for p, b in zip(ports, banners, strict=False) if b}
         return result
 
     async def network_map(self, network: str, use_arp=True, use_ping=True,
-                          max_hosts: int = 1024) -> Dict:
+                          max_hosts: int = 1024) -> dict:
         try:
             net = ipaddress.ip_network(network, strict=False)
         except ValueError as e:
@@ -2005,7 +2035,7 @@ class Recon:
         except Exception as e:
             return [f"Error: {e}"]
 
-    async def vuln_scan(self, target: str) -> List[Dict]:
+    async def vuln_scan(self, target: str) -> list[dict]:
         fp = await self.fingerprint(target)
         results = []
         vuln_map = {
@@ -2086,7 +2116,7 @@ class Pentest:
                 finally:
                     client.close()
 
-        with open(wordlist_path, 'r') as f:
+        with open(wordlist_path) as f:
             tasks = []
             for line in f:
                 pwd = line.strip()
@@ -2261,7 +2291,7 @@ class Report:
 </body></html>"""
 
     @staticmethod
-    def save(config: "Config", registry: "AttackRegistry", log_bus: "LogBus", net=None) -> Optional[str]:
+    def save(config: "Config", registry: "AttackRegistry", log_bus: "LogBus", net=None) -> str | None:
         try:
             out = config.output_dir
             out.mkdir(parents=True, exist_ok=True)
@@ -2288,7 +2318,7 @@ class AttackArgs:
     port: int
     duration: int
     pps: int
-    iface: Optional[str] = None
+    iface: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2563,7 +2593,7 @@ class UI:
         registry: AttackRegistry,
         log: LogBus,
         engine: AttackEngine,
-        audit: "Optional[AuditLog]" = None,
+        audit: "AuditLog | None" = None,
     ):
         self.config   = config
         self.net      = net
@@ -3570,10 +3600,15 @@ async def main(argv=None):
         console.print("[green]Goodbye.[/]")
 
 
-if __name__ == "__main__":
+def _run():
+    """Console-script entry point (``netwarrior``)."""
     if _UVLOOP:
         uvloop.install()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    _run()
