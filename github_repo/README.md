@@ -9,9 +9,9 @@
 ## What It Is
 
 NetWARRIOR is a Python-based async network security testing platform built for authorized
-penetration testers, red teamers, and security researchers. It provides a unified terminal
-interface for network stress testing, reconnaissance, vulnerability assessment, and web
-application testing.
+penetration testers, red teamers, and security researchers. It provides a unified interface —
+a terminal UI **and** an optional desktop GUI — for network stress testing, reconnaissance,
+vulnerability assessment, and web application testing.
 
 Designed as a learning resource for understanding how network attacks work — and how to
 defend against them. Every technique in the tool is paired with detection and
@@ -89,7 +89,12 @@ netwarrior.py            — single-file, self-contained
 ├── Pentest              — Brute force, web vuln probes
 ├── PostExploit          — Payload generators (`payload` command)
 ├── Report               — HTML session report (`report save`)
-└── UI                   — Adaptive Rich TUI
+└── UI                   — Adaptive Rich TUI (dispatches every command)
+
+netwarrior_gui.py        — Tk desktop front-end (optional)
+└── AsyncCore            — Runs the engine on a background asyncio loop and
+                           drives the same UI._process_command dispatcher, so
+                           the GUI and CLI share one code path and can't diverge
 ```
 
 **Async-first.** `asyncio` (plus `uvloop` on Linux/macOS) for all I/O. Blocking calls
@@ -146,6 +151,34 @@ On launch the tool checks for missing dependencies and prints an install command
 if any are absent. **The first interactive run prints the legal notice and asks
 you to type `I HAVE AUTHORIZATION` before it will start** (recorded in the config
 file; pass `--yes` to skip in automation).
+
+### Graphical interface (GUI)
+
+Prefer a desktop window to the terminal? Launch the Tk GUI:
+
+```bash
+python netwarrior_gui.py          # or, after `pip install .`:  netwarrior-gui
+```
+
+It takes the **same flags** as the CLI (`--safe`, `--scope`, `--iface`, `--yes`,
+`--no-audit`) and is a thin shell over the exact same engine — it drives the same
+command dispatcher the terminal UI uses, so every attack, recon/pentest probe,
+payload generator, report and **every guard rail** (safe-mode, scope allowlist,
+authorization gate, audit trail, pps clamp) behaves identically. The window gives
+you:
+
+- an **Attacks** tab with the full catalog grouped and colour-coded by category
+  (generated from `ATTACK_CATALOG`, so it can never drift from the CLI), plus
+  target/port/duration/pps fields and a Launch button;
+- **Recon**, **Pentest** and **Payloads** tabs with forms for every command;
+- a **Settings** tab (safe-mode, scope, interface, `max_pps`, …) that writes the
+  same `config.toml`;
+- live **stats**, an **active-attacks** table, a scrolling **log**, and an
+  **Output** console with a `>>` box that accepts *any* CLI command verbatim;
+- a **STOP ALL** button and a **SAFE MODE** toggle in the header.
+
+Tk ships with CPython, so the GUI needs no extra packages beyond the CLI's
+dependencies. On first run it shows the same authorization gate as a modal dialog.
 
 ### Command-line options
 

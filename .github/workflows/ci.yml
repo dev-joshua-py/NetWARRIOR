@@ -29,8 +29,8 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
       - name: Dead-code / undefined names (pyflakes)
-        run: python -m pyflakes netwarrior.py
+        run: python -m pyflakes netwarrior.py netwarrior_gui.py
       - name: Compile
-        run: python -m compileall -q netwarrior.py
+        run: python -m compileall -q netwarrior.py netwarrior_gui.py
       - name: Tests
         run: pytest -q

@@ -35,11 +35,14 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "pyflakes>=3.0", "ruff>=0.4"]
 [project.scripts]
 netwarrior = "netwarrior:_run"
 
+[project.gui-scripts]
+netwarrior-gui = "netwarrior_gui:main"
+
 [project.urls]
 Repository = "https://github.com/dev-joshua-py/NetWARRIOR"
 
 [tool.setuptools]
-py-modules = ["netwarrior"]
+py-modules = ["netwarrior", "netwarrior_gui"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
