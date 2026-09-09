@@ -617,7 +617,6 @@ class NetWarriorGUI:
                  self.f_dur.get() or "_",
                  self.f_pps.get() or "_"]
         self.submit(" ".join(parts))
-        self.nb_focus_console = True
 
     # ---- tab: recon ----------------------------------------------------------
     def _build_tab_recon(self):
@@ -982,10 +981,12 @@ class NetWarriorGUI:
         snap = log.get(200)
         if not snap:
             return
-        if self._last_log is not None and self._last_log in snap:
-            new = snap[snap.index(self._last_log) + 1:]
-        else:
-            new = snap
+        # Identity, not equality: LogBus never copies its entries, so two
+        # distinct messages with identical text/timestamp must not be
+        # mistaken for the same one and skipped.
+        idx = next((i for i, e in enumerate(snap) if e is self._last_log), None) \
+            if self._last_log is not None else None
+        new = snap[idx + 1:] if idx is not None else snap
         if not new:
             return
         self.logbox.configure(state="normal")

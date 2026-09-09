@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 NetWARRIOR Contributors
+Copyright (c) 2026 Joshua (dev-joshua-py)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -29,3 +29,18 @@ purposes only. Use of this software against systems without explicit written
 authorization from the system owner is illegal and unethical. The copyright
 holders assume no liability and are not responsible for any misuse or damage
 caused by this software.
+
+---
+
+ATTRIBUTION:
+
+This is original work. The MIT License above already requires that the
+copyright notice and this permission notice be retained in any copy or
+substantial portion of the Software — that condition is not optional.
+Stripping this notice, re-publishing this project (or a lightly modified
+copy of it) under a different name or claimed authorship, or presenting it
+as your own original work without attribution is a violation of these
+license terms, independent of any other applicable copyright law.
+
+If this project is useful to you, forking, modifying, and building on it is
+exactly what the license is for — just keep the notice intact.

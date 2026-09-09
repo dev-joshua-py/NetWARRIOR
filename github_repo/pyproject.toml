@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netwarrior"
-version = "0.3.0"
+version = "0.4.0"
 description = "Async network security testing suite (authorized use only)"
 readme = "README.md"
 requires-python = ">=3.11"

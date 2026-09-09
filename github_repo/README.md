@@ -268,13 +268,15 @@ is a Suricata ruleset tuned to this tool's exact payloads.
 pip install -e ".[dev]"      # from github_repo/
 ruff check .                  # lint
 python -m pyflakes netwarrior.py
-pytest -q                     # ~120 tests, no packets leave the machine
+pytest -q                     # 137 tests, no packets leave the machine
 ```
 
 `tests/` mocks scapy's senders and sniffer, so the suite runs unprivileged and
 offline. CI (`.github/workflows/ci.yml`) runs ruff + pyflakes + pytest on Python
 3.11–3.13. The `attack` command and the ATTACK menu are both generated from
 `ATTACK_CATALOG` — add a vector there once and both pick it up.
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ---
 
@@ -285,6 +287,22 @@ NetWARRIOR is inspired by and builds on concepts from:
 - [hping3](https://github.com/antirez/hping) — network testing
 - [Metasploit](https://github.com/rapid7/metasploit-framework) — penetration testing
 - [sqlmap](https://github.com/sqlmapproject/sqlmap) — SQL injection testing
+
+---
+
+## Author
+
+NetWARRIOR is designed, built, and maintained by **[dev-joshua-py](https://github.com/dev-joshua-py)**.
+
+This is an original project — architecture, attack catalog, safety-rail design,
+terminal UI, and the desktop GUI are all my own work. If you fork it, learn from
+it, or build on top of it, that's exactly what the MIT license below is for —
+just keep the copyright notice intact and don't pass this off as your own
+from-scratch work. See the **ATTRIBUTION** clause in [LICENSE](LICENSE) for
+what that means in practice.
+
+Found this useful? A star on the repo or a mention if you build on it is
+always appreciated.
 
 ---
 
